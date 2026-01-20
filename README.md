@@ -6,7 +6,22 @@ Works with lora, torch compile (needed to get full speedup).
 We auto-convert flux2 klein to INT8 on load if needed. Pre-quantized checkpoints with slightly higher quality and enabling faster loading are available here: 
 https://huggingface.co/bertbobson/FLUX.2-klein-9B-INT8-Comfy
 
-Requirements:
+# Metrics:
+
+Measured at 1024x1024, 26 steps with Flux2 Klein Base 9B.
+
+| Format | Speed (s/it) | Relative Speedup |
+|-------|--------------|------------------|
+| bf16 | 2.07 | 1.00× |
+| bf16 compile | 2.24 | 0.92× |
+| fp8 | 2.06 | 1.00× |
+| int8 | 1.64 | 1.26× |
+| int8 compile | 1.04 | 1.99× |
+| gguf8_0 compile | 2.03 | 1.02× |
+
+
+
+# Requirements:
 Working ComfyKitchen (needs latest comfy and possibly pytorch with cu130)
 Triton
 
