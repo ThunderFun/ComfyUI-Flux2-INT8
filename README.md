@@ -1,3 +1,11 @@
+# FORK EDITS
+- **INT8 Support:**  
+  The **WAN 2.2** INT8 files are functional.
+
+- **CPU Offloading (Always‑On, Buggy):** 
+  Added offloading to the CPU, but it cannot currently be disabled and may exhibit bugs.
+
+
 # Flux2 INT8 Acceleration
 
 This node speeds up Flux2 in ComfyUI by using INT8 quantization, delivering ~2x faster inference on my 3090, but it should work on any NVIDIA GPU with enough INT8 TOPS. It's unlikely to be faster than proper FP8 on 40-Series and above. 
