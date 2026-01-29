@@ -757,20 +757,10 @@ _shown_initial_kernel_info = False
 
 def _log_kernel_usage(kernel_type: str, layer_name: str = ""):
     """Log which kernel is being used for inference."""
-    global _shown_initial_kernel_info
     _inference_kernel_stats[kernel_type] = _inference_kernel_stats.get(kernel_type, 0) + 1
-    
-    if not _shown_initial_kernel_info:
-        _shown_initial_kernel_info = True
-        _print_initial_kernel_info()
     
     if _LOG_KERNEL_PER_LAYER:
         print(f"[INT8 KERNEL] {kernel_type}: {layer_name}")
-
-
-def _print_initial_kernel_info():
-    """Print one-time info about available kernels at start of inference."""
-    print(f"\n[INT8] Inference starting with:")
 
 
 def print_kernel_summary():
