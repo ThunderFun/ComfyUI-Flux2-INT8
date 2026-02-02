@@ -35,7 +35,7 @@ WAN_LORA_KEY_MAP = {
     r"blocks\.(\d+)\.attn\.v_proj": "diffusion_model.blocks.{i}.self_attn.to_v",
     r"blocks\.(\d+)\.attn\.out_proj": "diffusion_model.blocks.{i}.self_attn.to_out.0",
 
-    # New patterns from debug output (lora_unet_blocks style)
+    # lora_unet_blocks style patterns
     r"lora_unet_blocks_(\d+)_self_attn_q": "diffusion_model.blocks.{i}.self_attn.q",
     r"lora_unet_blocks_(\d+)_self_attn_k": "diffusion_model.blocks.{i}.self_attn.k",
     r"lora_unet_blocks_(\d+)_self_attn_v": "diffusion_model.blocks.{i}.self_attn.v",
@@ -115,13 +115,12 @@ class LoRAWeights:
             )
             self.is_int8[key] = True
         else:
-            # Convert to float16 for consistency and to avoid bfloat16->float16 conversion issues
-            # bfloat16->float16 conversion can introduce non-determinism during inference
-            target_dtype = torch.float16 if down.dtype in (torch.bfloat16, torch.float32) else down.dtype
+            # Store LoRA tensors in their original dtype (cast at application time)
+            # This preserves dtype information and avoids forcing bf16/fp32 -> fp16
             self.weights[key] = (
-                down.to(device=self.device, dtype=target_dtype),
-                up.to(device=self.device, dtype=target_dtype),
-                alpha
+                down.to(device=self.device),   # keep dtype
+                up.to(device=self.device),     # keep dtype
+                alpha,
             )
             self.is_int8[key] = False
     
@@ -237,9 +236,11 @@ def parse_wan_lora(state_dict, strength=1.0, debug=False):
                 up_weight = state_dict.pop(lora_b_key)
                 
                 alpha_value = None
+                alpha_source = None
                 for alpha_key in [base_key + ".alpha", base_key + ".lora_alpha", base_key + ".scaling"]:
                     if alpha_key in state_dict:
                         alpha_value = state_dict.pop(alpha_key)
+                        alpha_source = alpha_key.split(".")[-1]  # "alpha" / "lora_alpha" / "scaling"
                         break
                 
                 # Check for INT8 scales
@@ -265,6 +266,7 @@ def parse_wan_lora(state_dict, strength=1.0, debug=False):
                     "down": down_weight,
                     "up": up_weight,
                     "alpha": alpha_value,
+                    "alpha_source": alpha_source,
                     "down_scale": down_scale,
                     "up_scale": up_scale,
                     "is_clip": is_clip_key
@@ -319,12 +321,22 @@ def parse_wan_lora(state_dict, strength=1.0, debug=False):
             model_key = base_key
             
         alpha = weights["alpha"]
+        alpha_source = weights.get("alpha_source", None)
+        
         if alpha is not None:
             if isinstance(alpha, torch.Tensor):
-                alpha = alpha.item()
-            # LoRA scaling is alpha / rank
-            rank = weights["down"].shape[0]
-            scale = alpha / rank
+                alpha = float(alpha.item())
+            
+            # IMPORTANT:
+            # - if source is "scaling": it's already alpha/rank, so do NOT divide again
+            # - otherwise: treat it as alpha and compute alpha/rank
+            if alpha_source == "scaling":
+                scale = alpha
+            else:
+                rank = weights["down"].shape[0]
+                if rank == 0:
+                    rank = 1
+                scale = alpha / rank
         else:
             scale = 1.0
         

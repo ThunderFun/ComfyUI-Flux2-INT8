@@ -9,7 +9,6 @@ Uses torch._int_mm for blazing fast inference.
 """
 
 import torch
-import os
 
 def _apply_cudagraph_compatibility_fix():
     """

@@ -3,6 +3,16 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+# =============================================================================
+# Global Configuration (must be defined before use in lazy-loading functions)
+# =============================================================================
+
+_DEBUG_MODE = False
+_DEBUG_FORWARD = False
+
+if __import__('os').environ.get("INT8_DEBUG_MODE", "").lower() in ("1", "true", "yes"):
+    _DEBUG_MODE = True
+
 _TRITON_AVAILABLE = False
 try:
     import triton
@@ -21,8 +31,12 @@ def _get_triton_kernels():
         try:
             from .triton_kernels import triton_int8_linear
             _triton_kernels = triton_int8_linear
-        except Exception:
-            pass
+        except ImportError as e:
+            if _DEBUG_MODE:
+                print(f"[DEBUG] Failed to import triton_int8_linear: {e}")
+        except Exception as e:
+            if _DEBUG_MODE:
+                print(f"[DEBUG] Unexpected error importing triton kernels: {type(e).__name__}: {e}")
     return _triton_kernels
 
 
@@ -33,8 +47,12 @@ def _get_hadamard_quip_kernels():
         try:
             from .triton_kernels import triton_hadamard_quip_linear, pytorch_hadamard_quip_linear
             _hadamard_quip_kernels = (triton_hadamard_quip_linear, pytorch_hadamard_quip_linear)
-        except Exception:
-            pass
+        except ImportError as e:
+            if _DEBUG_MODE:
+                print(f"[DEBUG] Failed to import Hadamard-QuIP kernels: {e}")
+        except Exception as e:
+            if _DEBUG_MODE:
+                print(f"[DEBUG] Unexpected error importing Hadamard-QuIP kernels: {type(e).__name__}: {e}")
     return _hadamard_quip_kernels
 
 
@@ -50,8 +68,12 @@ def _get_quantize_int8_jit():
             def _quantize_int8_script(x: torch.Tensor, scale: float) -> torch.Tensor:
                 return x.float().mul(1.0 / scale).round_().clamp_(-128.0, 127.0).to(torch.int8)
             _quantize_int8_jit = _quantize_int8_script
-        except Exception:
-            pass
+        except RuntimeError as e:
+            print(f"[INT8 WARNING] JIT compilation failed for quantize_int8: {e}")
+            print(f"[INT8 WARNING] Falling back to non-JIT implementation (may be slower)")
+        except Exception as e:
+            print(f"[INT8 WARNING] Unexpected error in JIT quantize_int8: {type(e).__name__}: {e}")
+            print(f"[INT8 WARNING] Falling back to non-JIT implementation (may be slower)")
     return _quantize_int8_jit
 
 
@@ -64,8 +86,12 @@ def _get_dequantize_jit():
             def _dequantize_script(q: torch.Tensor, scale: float) -> torch.Tensor:
                 return q.float().mul(scale)
             _dequantize_jit = _dequantize_script
-        except Exception:
-            pass
+        except RuntimeError as e:
+            print(f"[INT8 WARNING] JIT compilation failed for dequantize: {e}")
+            print(f"[INT8 WARNING] Falling back to non-JIT implementation (may be slower)")
+        except Exception as e:
+            print(f"[INT8 WARNING] Unexpected error in JIT dequantize: {type(e).__name__}: {e}")
+            print(f"[INT8 WARNING] Falling back to non-JIT implementation (may be slower)")
     return _dequantize_jit
 
 
@@ -85,8 +111,12 @@ def quantize_int8(x: torch.Tensor, scale: float | torch.Tensor) -> torch.Tensor:
         if jit_fn is not None:
             try:
                 return jit_fn(x, float(scale))
-            except Exception:
-                pass
+            except (RuntimeError, ValueError, TypeError) as e:
+                if _DEBUG_MODE:
+                    print(f"[DEBUG] JIT quantize_int8 failed, falling back: {type(e).__name__}: {e}")
+            except Exception as e:
+                if _DEBUG_MODE:
+                    print(f"[DEBUG] Unexpected error in JIT quantize_int8: {type(e).__name__}: {e}")
     
     return x.float().mul(1.0 / scale).round_().clamp_(-128.0, 127.0).to(torch.int8)
 
@@ -189,7 +219,13 @@ def dequantize(q: Tensor, scale: float | Tensor, quip_s_u: Tensor | None = None,
             try:
                 from .triton_kernels import triton_hadamard_transform
                 w = triton_hadamard_transform(w, normalize=True)
-            except Exception:
+            except ImportError as e:
+                if _DEBUG_MODE:
+                    print(f"[DEBUG] Hadamard transform import failed, using PyTorch fallback: {e}")
+                w = _pytorch_fwht_simple(w)
+            except (RuntimeError, ValueError) as e:
+                if _DEBUG_MODE:
+                    print(f"[DEBUG] Hadamard transform failed, using PyTorch fallback: {type(e).__name__}: {e}")
                 w = _pytorch_fwht_simple(w)
         
         if sign_row is not None and hadamard_size_out > 0:
@@ -202,7 +238,13 @@ def dequantize(q: Tensor, scale: float | Tensor, quip_s_u: Tensor | None = None,
             try:
                 from .triton_kernels import triton_hadamard_transform
                 w = triton_hadamard_transform(w, normalize=True)
-            except Exception:
+            except ImportError as e:
+                if _DEBUG_MODE:
+                    print(f"[DEBUG] Hadamard transform import failed, using PyTorch fallback: {e}")
+                w = _pytorch_fwht_simple(w)
+            except (RuntimeError, ValueError) as e:
+                if _DEBUG_MODE:
+                    print(f"[DEBUG] Hadamard transform failed, using PyTorch fallback: {type(e).__name__}: {e}")
                 w = _pytorch_fwht_simple(w)
         
         if sign_col is not None and hadamard_size_in > 0:
@@ -240,8 +282,12 @@ def dequantize(q: Tensor, scale: float | Tensor, quip_s_u: Tensor | None = None,
         if jit_fn is not None:
             try:
                 return jit_fn(q, float(scale))
-            except Exception:
-                pass
+            except (RuntimeError, ValueError, TypeError) as e:
+                if _DEBUG_MODE:
+                    print(f"[DEBUG] JIT dequantize failed, falling back: {type(e).__name__}: {e}")
+            except Exception as e:
+                if _DEBUG_MODE:
+                    print(f"[DEBUG] Unexpected error in JIT dequantize: {type(e).__name__}: {e}")
 
     if total_elements > CHUNK_THRESHOLD_ELEMENTS:
         result = torch.empty_like(q, dtype=torch.float32)
@@ -259,6 +305,9 @@ def dequantize(q: Tensor, scale: float | Tensor, quip_s_u: Tensor | None = None,
             else:
                 chunk_scale = scale
             
+                if isinstance(chunk_scale, Tensor) and chunk_scale.device != chunk.device:
+                    chunk_scale = chunk_scale.to(chunk.device)
+            
             result[start_row:end_row] = chunk.float() * chunk_scale
             del chunk
         
@@ -266,6 +315,10 @@ def dequantize(q: Tensor, scale: float | Tensor, quip_s_u: Tensor | None = None,
     
     if isinstance(scale, Tensor) and scale.numel() > 1:
         scale = scale.view(-1, 1) if q.ndim == 2 else scale.view(-1)
+    
+    if isinstance(scale, Tensor) and scale.device != q.device:
+        scale = scale.to(q.device)
+    
     return q.float() * scale
 
 
@@ -415,11 +468,7 @@ except ImportError:
 CHUNK_THRESHOLD_ELEMENTS = 67_108_864
 CHUNK_TARGET_ELEMENTS = 33_554_432
 
-_DEBUG_MODE = False
-_DEBUG_FORWARD = False
-
-if os.environ.get("INT8_DEBUG_MODE", "").lower() in ("1", "true", "yes"):
-    _DEBUG_MODE = True
+# to ensure they're available for lazy-loading functions.
 
 _ENABLE_CUDA_SYNC = os.environ.get("INT8_ENABLE_CUDA_SYNC", "0") == "1"
 
@@ -505,13 +554,16 @@ else:
 
 
 @torch.no_grad()
-def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype, chunk_size: int = 0) -> Tensor:
+def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype, chunk_size: int = 0, has_lora: bool = False) -> Tensor:
     """Forward with dynamic per-token activation quantization."""
+    # Use FP32 for LoRA accumulation to maintain precision
+    output_dtype = torch.float32 if has_lora else compute_dtype
+    
     if chunk_size > 0 and x.shape[0] > chunk_size:
-        out = torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=compute_dtype)
+        out = torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=output_dtype)
         for i in range(0, x.shape[0], chunk_size):
             chunk = x[i:i+chunk_size]
-            out[i:i+chunk_size] = int8_forward_dynamic(chunk, weight, weight_scale, bias, compute_dtype, chunk_size=0)
+            out[i:i+chunk_size] = int8_forward_dynamic(chunk, weight, weight_scale, bias, compute_dtype, chunk_size=0, has_lora=has_lora)
             del chunk
         return out
 
@@ -524,15 +576,17 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
     if triton_kernels is not None and x.ndim >= 2:
         try:
             _log_kernel_usage("w8a8_dynamic_triton", "int8_forward_dynamic")
-            return triton_kernels(x, weight, weight_scale, bias, compute_dtype)
-        except Exception as e:
+            # Use FP32 output when LoRA is present for better accumulation precision
+            return triton_kernels(x, weight, weight_scale, bias, compute_dtype, use_fp32_output=has_lora)
+        except (RuntimeError, ValueError) as e:
             if _DEBUG_MODE:
-                print(f"[DEBUG] Triton fallback in int8_forward_dynamic: {e}")
-            pass
+                print(f"[DEBUG] Triton fallback in int8_forward_dynamic: {type(e).__name__}: {e}")
     
     x_8, x_scale = quantize_int8_axiswise(x, dim=-1)
-    res = torch._int_mm(x_8, weight.T)
-    del x_8
+    x_8_contig = x_8.contiguous() if not x_8.is_contiguous() else x_8
+    weight_T = weight.T.contiguous() if not weight.T.is_contiguous() else weight.T
+    res = torch._int_mm(x_8_contig, weight_T)
+    del x_8, x_8_contig, weight_T
     
     _log_tensor_size("int_mm result (INT32)", res, is_forward=True)
     
@@ -548,7 +602,7 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
         if _DEBUG_MODE:
             print(f"[CHUNK] Large tensor detected: {res.shape}, processing in chunks of {chunk_rows} rows")
         
-        res_scaled = torch.empty_like(res, dtype=compute_dtype)
+        res_scaled = torch.empty_like(res, dtype=output_dtype)
         
         for start_row in range(0, res.shape[0], chunk_rows):
             end_row = min(start_row + chunk_rows, res.shape[0])
@@ -556,24 +610,24 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
             chunk_int32 = res[start_row:end_row]
             
             if scale.numel() == 1 or scale.shape[0] == 1:
-                res_scaled[start_row:end_row] = chunk_int32.float().mul_(scale).to(compute_dtype)
+                res_scaled[start_row:end_row] = chunk_int32.float().mul_(scale).to(output_dtype)
             else:
                 chunk_scale = scale[start_row:end_row]
-                res_scaled[start_row:end_row] = chunk_int32.float().mul_(chunk_scale).to(compute_dtype)
+                res_scaled[start_row:end_row] = chunk_int32.float().mul_(chunk_scale).to(output_dtype)
             
             del chunk_int32
         
         if _DEBUG_MODE:
             print(f"[CHUNK] Completed chunked processing")
     else:
-        res_scaled = res.float().mul_(scale).to(compute_dtype)
+        res_scaled = res.float().mul_(scale).to(output_dtype)
     
     _log_memory("after float conversion", is_forward=True)
     
     del res, scale, x_scale
     
     if bias is not None:
-        res_scaled.add_(bias.to(compute_dtype))
+        res_scaled.add_(bias.to(output_dtype))
     
     _check_nan_inf(res_scaled, "output", "int8_forward_dynamic")
     
@@ -581,41 +635,49 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
 
 
 @torch.no_grad()
-def int8_forward_static(x: Tensor, weight: Tensor, weight_scale: float | Tensor, input_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype, chunk_size: int = 0) -> Tensor:
+def int8_forward_static(x: Tensor, weight: Tensor, weight_scale: float | Tensor, input_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype, chunk_size: int = 0, has_lora: bool = False) -> Tensor:
     """Forward with static (learned) activation quantization."""
+    # Use FP32 for LoRA accumulation to maintain precision
+    output_dtype = torch.float32 if has_lora else compute_dtype
+    
     if chunk_size > 0 and x.shape[0] > chunk_size:
-        out = torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=compute_dtype)
+        out = torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=output_dtype)
         for i in range(0, x.shape[0], chunk_size):
             chunk = x[i:i+chunk_size]
-            out[i:i+chunk_size] = int8_forward_static(chunk, weight, weight_scale, input_scale, bias, compute_dtype, chunk_size=0)
+            out[i:i+chunk_size] = int8_forward_static(chunk, weight, weight_scale, input_scale, bias, compute_dtype, chunk_size=0, has_lora=has_lora)
             del chunk
         return out
     
     x_8 = quantize_int8(x, input_scale)
-    res = torch._int_mm(x_8, weight.T)
-    del x_8
+    x_8_contig = x_8.contiguous() if not x_8.is_contiguous() else x_8
+    weight_T = weight.T.contiguous() if not weight.T.is_contiguous() else weight.T
+    res = torch._int_mm(x_8_contig, weight_T)
+    del x_8, x_8_contig, weight_T
     
     scale = weight_scale * input_scale
+    
+    # Use FP32 for LoRA accumulation to maintain precision
+    output_dtype = torch.float32 if has_lora else compute_dtype
     
     total_elements = res.numel()
     
     if total_elements > CHUNK_THRESHOLD_ELEMENTS:
         chunk_rows = max(1, (CHUNK_TARGET_ELEMENTS // res.shape[1]))
         
-        res_scaled = torch.empty_like(res, dtype=compute_dtype)
+        res_scaled = torch.empty_like(res, dtype=output_dtype)
         
         for start_row in range(0, res.shape[0], chunk_rows):
             end_row = min(start_row + chunk_rows, res.shape[0])
             chunk_int32 = res[start_row:end_row]
-            res_scaled[start_row:end_row] = chunk_int32.float().mul_(scale).to(compute_dtype)
+            res_scaled[start_row:end_row] = chunk_int32.float().mul_(scale).to(output_dtype)
             del chunk_int32
     else:
-        res_scaled = res.float().mul_(scale).to(compute_dtype)
+        res_scaled = res.float().mul_(scale).to(output_dtype)
     
     del res
     
     if bias is not None:
-        res_scaled.add_(bias.to(compute_dtype))
+        res_scaled.add_(bias.to(output_dtype))
     
     _check_nan_inf(res_scaled, "output", "int8_forward_static")
     
@@ -624,46 +686,76 @@ def int8_forward_static(x: Tensor, weight: Tensor, weight_scale: float | Tensor,
 
 @torch.no_grad()
 def chunked_lora_forward(x: Tensor, down: Tensor, up: Tensor, alpha: float, output: Tensor, offset: int = 0, size: int = 0):
-    """Memory-efficient float LoRA forward pass using chunking."""
+    """Memory-efficient float LoRA forward pass using chunking.
+    
+    When computing in FP32 on Ampere+ GPUs, TF32 is disabled to ensure
+    "true FP32" matmul precision for consistent numerics with BF16/FP16 baselines.
+    """
+    # Normalize dtype/device to match output (robust approach)
+    ref = output
+    if x.device != ref.device:
+        x = x.to(device=ref.device)
+    if x.dtype != ref.dtype:
+        x = x.to(dtype=ref.dtype)
+    
+    if down.device != ref.device or down.dtype != ref.dtype:
+        down = down.to(device=ref.device, dtype=ref.dtype)
+    if up.device != ref.device or up.dtype != ref.dtype:
+        up = up.to(device=ref.device, dtype=ref.dtype)
+    
     x_shape = x.shape
     x_2d = x.reshape(-1, x_shape[-1])
     
     chunk_rows = max(1, CHUNK_TARGET_ELEMENTS // max(down.shape[0], up.shape[0]))
     
-    if x_2d.shape[0] <= chunk_rows:
-        lora_out = F.linear(F.linear(x_2d, down), up)
-        
-        if size > 0:
-            output_view = output.reshape(-1, output.shape[-1])
-            if lora_out.shape[1] != size:
-                if lora_out.shape[1] > size:
-                    lora_out = lora_out[:, :size]
-                else:
-                    lora_out = torch.nn.functional.pad(lora_out, (0, size - lora_out.shape[1]))
-            output_view[:, offset:offset+size].add_(lora_out, alpha=alpha)
-        else:
-            lora_out = lora_out.reshape(*x_shape[:-1], lora_out.shape[-1])
-            output.add_(lora_out, alpha=alpha)
-    else:
-        output_view = output.reshape(-1, output.shape[-1])
-        for i in range(0, x_2d.shape[0], chunk_rows):
-            end = min(i + chunk_rows, x_2d.shape[0])
-            x_chunk = x_2d[i:end]
-            lora_out = F.linear(F.linear(x_chunk, down), up)
+    # When computing LoRA in FP32 on Ampere+ GPUs, disable TF32 to ensure
+    # "true FP32" matmul precision for consistent numerics vs BF16/FP16 baselines
+    is_fp32 = (x.dtype == torch.float32)
+    old_allow_tf32 = None
+    if is_fp32 and torch.cuda.is_available():
+        old_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+    
+    try:
+        if x_2d.shape[0] <= chunk_rows:
+            lora_out = F.linear(F.linear(x_2d, down), up)
             
             if size > 0:
+                output_view = output.reshape(-1, output.shape[-1])
                 if lora_out.shape[1] != size:
                     if lora_out.shape[1] > size:
                         lora_out = lora_out[:, :size]
                     else:
                         lora_out = torch.nn.functional.pad(lora_out, (0, size - lora_out.shape[1]))
-                output_view[i:end, offset:offset+size].add_(lora_out, alpha=alpha)
+                output_view[:, offset:offset+size].add_(lora_out, alpha=alpha)
             else:
-                output_view[i:end].add_(lora_out, alpha=alpha)
-            del lora_out
-            
-            if _ENABLE_CUDA_SYNC and i % (chunk_rows * 4) == 0:
-                torch.cuda.synchronize()
+                lora_out = lora_out.reshape(*x_shape[:-1], lora_out.shape[-1])
+                output.add_(lora_out, alpha=alpha)
+        else:
+            output_view = output.reshape(-1, output.shape[-1])
+            for i in range(0, x_2d.shape[0], chunk_rows):
+                end = min(i + chunk_rows, x_2d.shape[0])
+                x_chunk = x_2d[i:end]
+                lora_out = F.linear(F.linear(x_chunk, down), up)
+                
+                if size > 0:
+                    if lora_out.shape[1] != size:
+                        if lora_out.shape[1] > size:
+                            lora_out = lora_out[:, :size]
+                        else:
+                            lora_out = torch.nn.functional.pad(lora_out, (0, size - lora_out.shape[1]))
+                    output_view[i:end, offset:offset+size].add_(lora_out, alpha=alpha)
+                else:
+                    output_view[i:end].add_(lora_out, alpha=alpha)
+                del lora_out
+                
+                if _ENABLE_CUDA_SYNC and i % (chunk_rows * 4) == 0:
+                    torch.cuda.synchronize()
+    finally:
+        # Restore TF32 setting if we changed it
+        if old_allow_tf32 is not None:
+            torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
 
 
 @torch.no_grad()
@@ -676,8 +768,10 @@ def chunked_int8_lora_forward(x: Tensor, down: Tensor, up: Tensor, down_scale: f
     
     if x_2d.shape[0] <= chunk_rows:
         x_int8, x_scale = quantize_int8_axiswise(x_2d, dim=-1)
-        lora_inter = torch._int_mm(x_int8, down.T)
-        del x_int8
+        x_int8_contig = x_int8.contiguous() if not x_int8.is_contiguous() else x_int8
+        down_T = down.T.contiguous() if not down.T.is_contiguous() else down.T
+        lora_inter = torch._int_mm(x_int8_contig, down_T)
+        del x_int8, x_int8_contig, down_T
         
         lora_inter = lora_inter.to(dtype=torch.float32)
         lora_inter.mul_(x_scale * down_scale)
@@ -685,8 +779,10 @@ def chunked_int8_lora_forward(x: Tensor, down: Tensor, up: Tensor, down_scale: f
         inter_int8, inter_scale = quantize_int8_axiswise(lora_inter, dim=-1)
         del lora_inter, x_scale
         
-        lora_out = torch._int_mm(inter_int8, up.T)
-        del inter_int8
+        inter_int8_contig = inter_int8.contiguous() if not inter_int8.is_contiguous() else inter_int8
+        up_T = up.T.contiguous() if not up.T.is_contiguous() else up.T
+        lora_out = torch._int_mm(inter_int8_contig, up_T)
+        del inter_int8, inter_int8_contig, up_T
         
         lora_out = lora_out.to(dtype=torch.float32)
         lora_out.mul_(inter_scale * up_scale)
@@ -705,8 +801,10 @@ def chunked_int8_lora_forward(x: Tensor, down: Tensor, up: Tensor, down_scale: f
             x_chunk = x_2d[i:end]
             
             x_int8, x_scale = quantize_int8_axiswise(x_chunk, dim=-1)
-            lora_inter = torch._int_mm(x_int8, down.T)
-            del x_int8
+            x_int8_contig = x_int8.contiguous() if not x_int8.is_contiguous() else x_int8
+            down_T = down.T.contiguous() if not down.T.is_contiguous() else down.T
+            lora_inter = torch._int_mm(x_int8_contig, down_T)
+            del x_int8, x_int8_contig, down_T
             
             lora_inter = lora_inter.to(dtype=torch.float32)
             lora_inter.mul_(x_scale * down_scale)
@@ -714,8 +812,10 @@ def chunked_int8_lora_forward(x: Tensor, down: Tensor, up: Tensor, down_scale: f
             inter_int8, inter_scale = quantize_int8_axiswise(lora_inter, dim=-1)
             del lora_inter, x_scale
             
-            lora_out = torch._int_mm(inter_int8, up.T)
-            del inter_int8
+            inter_int8_contig = inter_int8.contiguous() if not inter_int8.is_contiguous() else inter_int8
+            up_T = up.T.contiguous() if not up.T.is_contiguous() else up.T
+            lora_out = torch._int_mm(inter_int8_contig, up_T)
+            del inter_int8, inter_int8_contig, up_T
             
             lora_out = lora_out.to(dtype=torch.float32)
             lora_out.mul_(inter_scale * up_scale)
@@ -757,10 +857,12 @@ _shown_initial_kernel_info = False
 
 def _log_kernel_usage(kernel_type: str, layer_name: str = ""):
     """Log which kernel is being used for inference."""
+    global _shown_initial_kernel_info
     _inference_kernel_stats[kernel_type] = _inference_kernel_stats.get(kernel_type, 0) + 1
     
     if _LOG_KERNEL_PER_LAYER:
         print(f"[INT8 KERNEL] {kernel_type}: {layer_name}")
+        _shown_initial_kernel_info = True
 
 
 def print_kernel_summary():
@@ -793,15 +895,15 @@ def cast_int8_weights(layer, device):
     
     weight_scale = getattr(layer, "weight_scale", None)
     if isinstance(weight_scale, torch.Tensor):
-        weight_scale = weight_scale.to(device)
+                weight_scale = weight_scale.to(weight.device)
     
     input_scale = getattr(layer, "input_scale", None)
     if isinstance(input_scale, torch.Tensor):
-        input_scale = input_scale.to(device)
+                input_scale = input_scale.to(weight.device)
         
     bias = None
     if getattr(layer, "bias", None) is not None:
-        bias = layer.bias.to(device)
+                bias = layer.bias.to(weight.device)
         
     return weight, weight_scale, input_scale, bias
 
@@ -858,16 +960,40 @@ if _COMFY_OPS_AVAILABLE:
             ):
                 """Directly load int8 weights and scales from state dict."""
                 weight_key = prefix + "weight"
-                weight_scale = state_dict.pop(prefix + "weight_scale",
-                               state_dict.pop(prefix + "scale",
-                               state_dict.pop(prefix + "weight.scale",
-                               state_dict.pop(prefix + "weight.weight_scale", 
-                               state_dict.pop(prefix + "scale_weight", None)))))
+                weight_scale_keys = [
+                    prefix + "weight_scale",
+                    prefix + "scale",
+                    prefix + "weight.scale",
+                    prefix + "weight.weight_scale",
+                    prefix + "scale_weight",
+                ]
+                weight_scale = None
+                found_weight_scale_key = None
+                for key in weight_scale_keys:
+                    if key in state_dict:
+                        if weight_scale is not None:
+                            # Conflict: multiple scale keys found
+                            print(f"[INT8 WARNING] Multiple weight_scale keys found for {prefix}: "
+                                  f"'{found_weight_scale_key}' and '{key}'. Using '{key}'.")
+                        weight_scale = state_dict.pop(key)
+                        found_weight_scale_key = key
                 
-                input_scale = state_dict.pop(prefix + "input_scale",
-                              state_dict.pop(prefix + "act_scale",
-                              state_dict.pop(prefix + "input.scale",
-                              state_dict.pop(prefix + "input.input_scale", None))))
+                input_scale_keys = [
+                    prefix + "input_scale",
+                    prefix + "act_scale",
+                    prefix + "input.scale",
+                    prefix + "input.input_scale",
+                ]
+                input_scale = None
+                found_input_scale_key = None
+                for key in input_scale_keys:
+                    if key in state_dict:
+                        if input_scale is not None:
+                            # Conflict: multiple scale keys found
+                            print(f"[INT8 WARNING] Multiple input_scale keys found for {prefix}: "
+                                  f"'{found_input_scale_key}' and '{key}'. Using '{key}'.")
+                        input_scale = state_dict.pop(key)
+                        found_input_scale_key = key
 
                 quip_s_u = state_dict.pop(prefix + "quip_s_u", None)
                 quip_s_v = state_dict.pop(prefix + "quip_s_v", None)
@@ -1062,25 +1188,57 @@ if _COMFY_OPS_AVAILABLE:
                 
                 if not self._is_quantized:
                     _log_kernel_usage("non_quantized", self.__class__.__name__)
+                    
+                    lora_patches = getattr(self, "lora_patches", [])
+                    has_lora = len(lora_patches) > 0
+                    
+                    # Use FP32 for LoRA accumulation to maintain precision
+                    compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+                    acc_dtype = torch.float32 if has_lora else compute_dtype
+                    
+                    if _DEBUG_MODE and has_lora:
+                        print(f"[DEBUG LoRA NON-QUANTIZED] Layer: {self}")
+                        print(f"[DEBUG LoRA NON-QUANTIZED]   x dtype: {x.dtype}")
+                        print(f"[DEBUG LoRA NON-QUANTIZED]   compute_dtype: {compute_dtype}")
+                        print(f"[DEBUG LoRA NON-QUANTIZED]   acc_dtype (for LoRA): {acc_dtype}")
+                    
                     if _COMFY_OPS_AVAILABLE:
                         weight, bias, offload_stream = cast_bias_weight(
                             self, x, offloadable=True
                         )
-                        out = F.linear(x, weight, bias)
+                        # Cast weight to accumulation dtype if LoRA is present
+                        if has_lora:
+                            weight = weight.to(acc_dtype)
+                            if bias is not None:
+                                bias = bias.to(acc_dtype)
+                            x_compute = x.to(acc_dtype)
+                        else:
+                            x_compute = x
+                        out = F.linear(x_compute, weight, bias)
                         uncast_bias_weight(self, weight, bias, offload_stream)
                     else:
-                        weight = self.weight.to(x.device, dtype=x.dtype)
+                        weight = self.weight.to(x.device, dtype=acc_dtype if has_lora else x.dtype)
                         bias = getattr(self, "bias", None)
                         if bias is not None:
-                            bias = bias.to(x.device, dtype=x.dtype)
-                        out = F.linear(x, weight, bias)
+                            bias = bias.to(x.device, dtype=acc_dtype if has_lora else x.dtype)
+                        x_compute = x.to(acc_dtype) if has_lora else x
+                        out = F.linear(x_compute, weight, bias)
                     
-                    lora_patches = getattr(self, "lora_patches", [])
                     if lora_patches:
                         x_shape = x.shape
                         x_2d = x.reshape(-1, x_shape[-1])
                         
-                        for patch_data in lora_patches:
+                        if _DEBUG_MODE:
+                            print(f"[DEBUG LoRA APPLY NON-QUANTIZED]   x_2d dtype: {x_2d.dtype}")
+                            print(f"[DEBUG LoRA APPLY NON-QUANTIZED]   out/base dtype: {out.dtype}")
+                        
+                        # Ensure x_2d matches out dtype for LoRA application (FP32 accumulation case)
+                        if x_2d.dtype != out.dtype:
+                            if _DEBUG_MODE:
+                                print(f"[DEBUG LoRA APPLY NON-QUANTIZED]   Casting x_2d from {x_2d.dtype} to {out.dtype}")
+                            x_2d = x_2d.to(out.dtype)
+                        
+                        for idx, patch_data in enumerate(lora_patches):
                             if len(patch_data) == 3:
                                 down, up, alpha = patch_data
                                 down_scale, up_scale = None, None
@@ -1092,6 +1250,11 @@ if _COMFY_OPS_AVAILABLE:
                                 down, up, alpha, down_scale, up_scale, offset, size = patch_data
                             
                             is_int8 = down.dtype == torch.int8 and up.dtype == torch.int8
+                            
+                            if _DEBUG_MODE:
+                                print(f"[DEBUG LoRA PATCH {idx} NON-QUANTIZED] is_int8: {is_int8}")
+                                print(f"[DEBUG LoRA PATCH {idx} NON-QUANTIZED]   down dtype: {down.dtype}, up dtype: {up.dtype}")
+                                print(f"[DEBUG LoRA PATCH {idx} NON-QUANTIZED]   target dtype (out.dtype): {out.dtype}")
                             
                             if is_int8 and down_scale is not None and up_scale is not None:
                                 x_shape = x.shape
@@ -1117,19 +1280,33 @@ if _COMFY_OPS_AVAILABLE:
                                 else:
                                     d = dequantize(down, down_scale).to(device=out.device, dtype=out.dtype)
                                     u = dequantize(up, up_scale).to(device=out.device, dtype=out.dtype)
-                                    lora_out = F.linear(F.linear(x_2d, d), u)
-                                    if size > 0:
-                                        out_view = out.reshape(-1, out.shape[-1])
-                                        if lora_out.shape[1] != size:
-                                            if lora_out.shape[1] > size:
-                                                lora_out = lora_out[:, :size]
-                                            else:
-                                                lora_out = torch.nn.functional.pad(lora_out, (0, size - lora_out.shape[1]))
-                                        out_view[:, offset:offset+size].add_(lora_out, alpha=alpha)
-                                    else:
-                                        lora_out = lora_out.reshape(*out.shape)
-                                        out.add_(lora_out, alpha=alpha)
-                                    del d, u, lora_out
+                                    
+                                    # Disable TF32 for true FP32 matmul precision on Ampere+ GPUs
+                                    is_fp32 = (out.dtype == torch.float32)
+                                    if is_fp32 and torch.cuda.is_available():
+                                        old_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+                                        torch.backends.cuda.matmul.allow_tf32 = False
+                                        torch.set_float32_matmul_precision("highest")
+                                    
+                                    try:
+                                        lora_out = F.linear(F.linear(x_2d, d), u)
+                                        if size > 0:
+                                            out_view = out.reshape(-1, out.shape[-1])
+                                            if lora_out.shape[1] != size:
+                                                if lora_out.shape[1] > size:
+                                                    lora_out = lora_out[:, :size]
+                                                else:
+                                                    lora_out = torch.nn.functional.pad(lora_out, (0, size - lora_out.shape[1]))
+                                            out_view[:, offset:offset+size].add_(lora_out, alpha=alpha)
+                                        else:
+                                            lora_out = lora_out.reshape(*out.shape)
+                                            out.add_(lora_out, alpha=alpha)
+                                        del lora_out
+                                    finally:
+                                        if is_fp32 and torch.cuda.is_available():
+                                            torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
+                                    
+                                    del d, u
                             else:
                                 d = down.to(device=out.device, dtype=out.dtype)
                                 u = up.to(device=out.device, dtype=out.dtype)
@@ -1137,6 +1314,17 @@ if _COMFY_OPS_AVAILABLE:
                                 chunked_lora_forward(x_2d, d, u, alpha, out, offset=offset, size=size)
                                 
                                 del d, u
+                    
+                    # Cast back to compute_dtype if we used FP32 for LoRA accumulation
+                    # This ensures consistency between quantized/non-quantized and LoRA/non-LoRA layers
+                    # Policy B: Use FP32 as temporary accumulator, then cast back to compute_dtype
+                    if has_lora and out.dtype != compute_dtype:
+                        if _DEBUG_MODE:
+                            print(f"[DEBUG LoRA CAST NON-QUANTIZED] Casting output from {out.dtype} back to {compute_dtype}")
+                        out = out.to(compute_dtype)
+                    elif _DEBUG_MODE and has_lora:
+                        print(f"[DEBUG LoRA CAST NON-QUANTIZED] Output already in compute_dtype: {compute_dtype}")
+                    
                     return out
                 
                 compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
@@ -1145,6 +1333,25 @@ if _COMFY_OPS_AVAILABLE:
                 x_2d = x.reshape(-1, x_shape[-1])
                 
                 weight, weight_scale, input_scale, bias = cast_int8_weights(self, x_2d.device)
+                
+                # Check for LoRA patches and use FP32 accumulation if present
+                lora_patches = getattr(self, "lora_patches", [])
+                has_lora = len(lora_patches) > 0
+                acc_dtype = torch.float32 if has_lora else compute_dtype
+                
+                if bias is not None and has_lora and bias.dtype != acc_dtype:
+                    bias = bias.to(acc_dtype)
+                
+                if _DEBUG_MODE and has_lora:
+                    print(f"[DEBUG LoRA] Layer: {self}")
+                    print(f"[DEBUG LoRA]   x dtype: {x.dtype}")
+                    print(f"[DEBUG LoRA]   compute_dtype: {compute_dtype}")
+                    print(f"[DEBUG LoRA]   acc_dtype (for LoRA): {acc_dtype}")
+                    print(f"[DEBUG LoRA]   weight dtype: {weight.dtype}")
+                    if bias is not None:
+                        print(f"[DEBUG LoRA]   bias dtype: {bias.dtype}")
+                    else:
+                        print(f"[DEBUG LoRA]   bias: None")
                 
                 if self._hadamard_quip and x_2d.shape[0] > 16:
                     hadamard_kernels = _get_hadamard_quip_kernels()
@@ -1188,12 +1395,13 @@ if _COMFY_OPS_AVAILABLE:
                         try:
                             _log_kernel_usage("hadamard_quip_triton", self.__class__.__name__)
                             y = triton_hadamard_quip_linear(
-                                x_2d, weight, weight_scale, bias, compute_dtype,
+                                x_2d, weight, weight_scale, bias, acc_dtype,
                                 hadamard_size_in=self._hadamard_size_in,
                                 hadamard_size_out=self._hadamard_size_out,
                                 sign_row=sign_row,
                                 sign_col=sign_col,
-                                out_features=self.out_features
+                                out_features=self.out_features,
+                                use_fp32_output=has_lora
                             )
                             if y.shape[-1] != self.out_features:
                                 if _DEBUG_MODE:
@@ -1220,7 +1428,7 @@ if _COMFY_OPS_AVAILABLE:
                             try:
                                 _log_kernel_usage("hadamard_quip_pytorch", self.__class__.__name__)
                                 y = pytorch_hadamard_quip_linear(
-                                    x_2d, weight, weight_scale, bias, compute_dtype,
+                                    x_2d, weight, weight_scale, bias, acc_dtype,
                                     hadamard_size_in=self._hadamard_size_in,
                                     hadamard_size_out=self._hadamard_size_out,
                                     sign_row=sign_row,
@@ -1260,15 +1468,17 @@ if _COMFY_OPS_AVAILABLE:
                         _log_kernel_usage("w8a8_static", self.__class__.__name__)
                         y = int8_forward_static(
                             x_2d, weight, weight_scale,
-                            input_scale, bias, compute_dtype,
-                            chunk_size=Int8TensorwiseOps.chunk_size
+                            input_scale, bias, acc_dtype,
+                            chunk_size=Int8TensorwiseOps.chunk_size,
+                            has_lora=bool(lora_patches)
                         )
                     else:
                         _log_kernel_usage("w8a8_dynamic", self.__class__.__name__)
                         y = int8_forward_dynamic(
                             x_2d, weight, weight_scale,
-                            bias, compute_dtype,
-                            chunk_size=Int8TensorwiseOps.chunk_size
+                            bias, acc_dtype,
+                            chunk_size=Int8TensorwiseOps.chunk_size,
+                            has_lora=bool(lora_patches)
                         )
                 else:
                     _log_kernel_usage("dequant_fallback", self.__class__.__name__)
@@ -1296,6 +1506,21 @@ if _COMFY_OPS_AVAILABLE:
                 lora_patches = getattr(self, "lora_patches", [])
                 if lora_patches:
                     _log_memory(f"before LoRA application ({len(lora_patches)} patches)", is_forward=True)
+                    
+                    if _DEBUG_MODE:
+                        print(f"[DEBUG LoRA APPLY] Layer quantized: {self._is_quantized}")
+                        print(f"[DEBUG LoRA APPLY]   x dtype: {x.dtype}")
+                        print(f"[DEBUG LoRA APPLY]   x_2d dtype: {x_2d.dtype}")
+                        print(f"[DEBUG LoRA APPLY]   y/base dtype: {y.dtype}")
+                        print(f"[DEBUG LoRA APPLY]   compute_dtype: {compute_dtype}")
+                        print(f"[DEBUG LoRA APPLY]   acc_dtype used: {acc_dtype}")
+                    
+                    # Ensure x_2d matches y dtype for LoRA application (FP32 accumulation case)
+                    if x_2d.dtype != y.dtype:
+                        if _DEBUG_MODE:
+                            print(f"[DEBUG LoRA APPLY]   Casting x_2d from {x_2d.dtype} to {y.dtype}")
+                        x_2d = x_2d.to(y.dtype)
+                    
                     for idx, patch_data in enumerate(lora_patches):
                         if len(patch_data) == 3:
                             down, up, alpha = patch_data
@@ -1308,6 +1533,15 @@ if _COMFY_OPS_AVAILABLE:
                             down, up, alpha, down_scale, up_scale, offset, size = patch_data
                         
                         is_int8 = down.dtype == torch.int8 and up.dtype == torch.int8
+                        
+                        if _DEBUG_MODE:
+                            print(f"[DEBUG LoRA PATCH {idx}] is_int8: {is_int8}")
+                            print(f"[DEBUG LoRA PATCH {idx}]   down dtype: {down.dtype}, shape: {down.shape}")
+                            print(f"[DEBUG LoRA PATCH {idx}]   up dtype: {up.dtype}, shape: {up.shape}")
+                            if is_int8:
+                                print(f"[DEBUG LoRA PATCH {idx}]   down_scale: {down_scale}, up_scale: {up_scale}")
+                            print(f"[DEBUG LoRA PATCH {idx}]   target dtype (y.dtype): {y.dtype}")
+                            print(f"[DEBUG LoRA PATCH {idx}]   alpha: {alpha}")
                         
                         if is_int8 and down_scale is not None and up_scale is not None:
                             _log_memory(f"INT8 LoRA {idx} start", is_forward=True)
@@ -1335,13 +1569,27 @@ if _COMFY_OPS_AVAILABLE:
                             else:
                                 d = dequantize(down, down_scale).to(device=y.device, dtype=y.dtype)
                                 u = dequantize(up, up_scale).to(device=y.device, dtype=y.dtype)
-                                lora_out = F.linear(F.linear(x_2d, d), u)
-                                if size > 0:
-                                    y_view = y.reshape(-1, y.shape[-1])
-                                    y_view[:, offset:offset+size].add_(lora_out.reshape(-1, size), alpha=alpha)
-                                else:
-                                    y.add_(lora_out, alpha=alpha)
-                                del d, u, lora_out
+                                
+                                # Disable TF32 for true FP32 matmul precision on Ampere+ GPUs
+                                is_fp32 = (y.dtype == torch.float32)
+                                if is_fp32 and torch.cuda.is_available():
+                                    old_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+                                    torch.backends.cuda.matmul.allow_tf32 = False
+                                    torch.set_float32_matmul_precision("highest")
+                                
+                                try:
+                                    lora_out = F.linear(F.linear(x_2d, d), u)
+                                    if size > 0:
+                                        y_view = y.reshape(-1, y.shape[-1])
+                                        y_view[:, offset:offset+size].add_(lora_out.reshape(-1, size), alpha=alpha)
+                                    else:
+                                        y.add_(lora_out, alpha=alpha)
+                                    del lora_out
+                                finally:
+                                    if is_fp32 and torch.cuda.is_available():
+                                        torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
+                                
+                                del d, u
                             
                             _log_memory(f"INT8 LoRA {idx} end", is_forward=True)
                         else:
@@ -1353,6 +1601,16 @@ if _COMFY_OPS_AVAILABLE:
                             
                             del d, u
                     _log_memory("after LoRA application", is_forward=True)
+
+                # Cast back to compute_dtype if we used FP32 for LoRA accumulation
+                # This ensures consistency between quantized/non-quantized and LoRA/non-LoRA layers
+                # Policy B: Use FP32 as temporary accumulator, then cast back to compute_dtype
+                if has_lora and y.dtype != compute_dtype:
+                    if _DEBUG_MODE:
+                        print(f"[DEBUG LoRA CAST] Casting output from {y.dtype} back to {compute_dtype}")
+                    y = y.to(compute_dtype)
+                elif _DEBUG_MODE and has_lora:
+                    print(f"[DEBUG LoRA CAST] Output already in compute_dtype: {compute_dtype}")
 
                 del weight, weight_scale, input_scale, bias
                 
@@ -1385,12 +1643,9 @@ if _COMFY_OPS_AVAILABLE:
                         
                         d = down.to(device=out.device, dtype=out.dtype)
                         u = up.to(device=out.device, dtype=out.dtype)
-                        try:
-                            lora_out = F.conv2d(F.conv2d(x, d), u)
-                            out.add_(lora_out, alpha=alpha)
-                        except Exception:
-                            pass
-                        del d, u
+                        lora_out = F.conv2d(F.conv2d(x, d), u)
+                        out.add_(lora_out, alpha=alpha)
+                        del lora_out, d, u
                 return out
         
         class Conv3d(manual_cast.Conv3d):

@@ -26,6 +26,7 @@ def _should_clear_cache():
     reserved = torch.cuda.memory_reserved()
     if reserved > 0:
         utilization = allocated / reserved
+                # This prevents unnecessary clearing when memory is actually being used
         return utilization < 0.5
     return False
 
@@ -34,15 +35,74 @@ try:
 except ImportError:
     Int8TensorwiseOps = None
 
+class LoRAWeightCache:
+    """LRU cache for LoRA weights with automatic cleanup."""
+    
+    def __init__(self, max_size=_MAX_LORA_CACHE_SIZE):
+        self.max_size = max_size
+        self._cache = {}
+        self._access_order = []
+    
+    def get(self, key):
+        if key in self._cache:
+            # Move to end (most recently used)
+            if key in self._access_order:
+                self._access_order.remove(key)
+            self._access_order.append(key)
+            return self._cache[key]
+        return None
+    
+    def set(self, key, value):
+        if key in self._cache:
+            # Update existing
+            self._cache[key] = value
+            if key in self._access_order:
+                self._access_order.remove(key)
+            self._access_order.append(key)
+        else:
+            # Evict oldest if at capacity
+            if len(self._cache) >= self.max_size:
+                self._evict_oldest()
+            self._cache[key] = value
+            self._access_order.append(key)
+    
+    def _evict_oldest(self):
+        if self._access_order:
+            oldest = self._access_order.pop(0)
+            if oldest in self._cache:
+                del self._cache[oldest]
+    
+    def clear(self):
+        """Clear all cached weights and free memory."""
+        self._cache.clear()
+        self._access_order.clear()
+    
+    def __len__(self):
+        return len(self._cache)
+
+
 def make_patched_forward(mod, orig_fwd):
-    # LoRA weight cache - persists across forward calls
-    _lora_weight_cache = {}
+    # Attach cache to module for external access and cleanup
+    if not hasattr(mod, '_lora_weight_cache'):
+        mod._lora_weight_cache = LoRAWeightCache(_MAX_LORA_CACHE_SIZE)
     
     def patched_forward(x):
-        nonlocal _lora_weight_cache
         out = orig_fwd(x)
         patches = getattr(mod, "lora_patches", [])
         if patches:
+            # Clear cache if patches have changed (different LoRA loaded)
+            def patch_hash(p):
+                """Create a hash based on patch tensor shapes and dtypes, not memory address."""
+                d, u = p[0], p[1]
+                return hash((d.shape, d.dtype, u.shape, u.dtype, id(p)))  # id(p) as fallback entropy
+            
+            current_patch_ids = tuple(patch_hash(p) for p in patches)
+            last_patch_ids = getattr(mod, '_last_patch_ids', None)
+            if last_patch_ids is not None and last_patch_ids != current_patch_ids:
+                # Patches changed - clear the cache to prevent memory leak
+                mod._lora_weight_cache.clear()
+            mod._last_patch_ids = current_patch_ids
+            
             for patch_data in patches:
                 # Unpack patch data (supports both old and new format)
                 if len(patch_data) == 3:
@@ -69,27 +129,49 @@ def make_patched_forward(mod, orig_fwd):
                     x_shape = x.shape
                     x_2d = x.reshape(-1, x_shape[-1])
                     
-                    # Use cache key based on patch data identity
-                    cache_key = id(patch_data)
-                    
-                    if cache_key not in _lora_weight_cache:
-                        # First time - move to GPU and cache
-                        if len(_lora_weight_cache) >= _MAX_LORA_CACHE_SIZE:
-                            # Evict oldest entry (simple FIFO)
-                            oldest_key = next(iter(_lora_weight_cache))
-                            del _lora_weight_cache[oldest_key]
+                                        # Use hash of full tensor bytes for small tensors, sampled hash + checksum for large
+                    def tensor_content_hash(t):
+                        """Create a strong hash based on tensor content."""
+                        if t.numel() == 0:
+                            return 0
                         
-                        _lora_weight_cache[cache_key] = {
+                        # For small tensors, hash the full content
+                        if t.numel() <= 1024:
+                            return hash((t.tobytes(), t.shape, t.dtype, t.device.index if t.device.type == 'cuda' else -1))
+                        
+                        # For large tensors, use multiple samples + statistical summary
+                        flat = t.flatten()
+                        n = flat.numel()
+                        
+                        # Sample at multiple points with denser sampling at boundaries
+                        sample_indices = [
+                            0, 1, 2,  # Start
+                            n // 8, n // 4, n // 2, 3 * n // 4, 7 * n // 8,  # Middle regions
+                            n - 3, n - 2, n - 1  # End
+                        ]
+                        sample_indices = list(dict.fromkeys(i for i in sample_indices if 0 <= i < n))  # Unique valid indices
+                        samples = flat[sample_indices].tolist()
+                        
+                        # Add statistical summary to detect distribution changes
+                        mean_val = flat.mean().item()
+                        std_val = flat.std().item()
+                        
+                        return hash((tuple(samples), mean_val, std_val, t.shape, t.dtype, t.device.index if t.device.type == 'cuda' else -1))
+                    
+                    cache_key = (d.shape, d.dtype, u.shape, u.dtype, tensor_content_hash(d), tensor_content_hash(u))
+                    
+                    cached = mod._lora_weight_cache.get(cache_key)
+                    if cached is None:
+                        # First time - move to GPU and cache
+                        cached = {
                             'd': d.to(device=out.device, non_blocking=True),
                             'u': u.to(device=out.device, non_blocking=True),
                             'd_scale': d_scale.to(device=out.device, non_blocking=True) if isinstance(d_scale, torch.Tensor) else d_scale,
                             'u_scale': u_scale.to(device=out.device, non_blocking=True) if isinstance(u_scale, torch.Tensor) else u_scale,
                         }
+                        mod._lora_weight_cache.set(cache_key, cached)
                     
                     # Use cached weights
-                    cached = _lora_weight_cache[cache_key]
-                    
-                    # Use memory-efficient chunked forward
                     chunked_int8_lora_forward(
                         x_2d, cached['d'], cached['u'], 
                         cached['d_scale'], cached['u_scale'], 
@@ -99,7 +181,10 @@ def make_patched_forward(mod, orig_fwd):
                     
                     # Clear cache based on memory pressure strategy
                     if out.numel() > CHUNK_THRESHOLD_ELEMENTS and _should_clear_cache():
+                        mod._lora_weight_cache.clear()
                         torch.cuda.empty_cache()
+                    
+                    del x_2d
                 else:
                     # Float LoRA path
                     from .int8_quant import chunked_lora_forward
@@ -107,6 +192,10 @@ def make_patched_forward(mod, orig_fwd):
                     # Flatten x to 2D for matmul (consistent with INT8 path)
                     x_shape = x.shape
                     x_2d = x.reshape(-1, x_shape[-1])
+                    
+                    # Ensure x matches output dtype for LoRA math
+                    if x_2d.dtype != out.dtype:
+                        x_2d = x_2d.to(dtype=out.dtype)
                     
                     d_t = d.to(device=out.device, dtype=out.dtype)
                     u_t = u.to(device=out.device, dtype=out.dtype)
@@ -351,6 +440,21 @@ class WanLoRALoaderWithCLIP:
                             down_scale = down_scale.to(device=device, non_blocking=True)
                         if isinstance(up_scale, torch.Tensor):
                             up_scale = up_scale.to(device=device, non_blocking=True)
+                    
+                    if patch_size > 0 and hasattr(target_module, "weight"):
+                        expected_out = target_module.weight.shape[0]
+                        if patch_offset + patch_size > expected_out:
+                            print(f"  [!] Bounds check failed for {target_key}: offset={patch_offset}, size={patch_size}, output_dim={expected_out}")
+                            # Clamp to valid range
+                            patch_size = max(0, expected_out - patch_offset)
+                            if patch_size <= 0:
+                                print(f"  [!] Skipping patch for {target_key}: size would be <=0 after clamping")
+                                continue
+                            print(f"  [!] Clamped patch_size to {patch_size} for {target_key}")
+                    
+                    if patch_size <= 0 and patch_offset > 0:
+                        print(f"  [!] Skipping patch for {target_key}: invalid patch size {patch_size}")
+                        continue
                     
                     # Create a new list with the additional patch
                     # Store as (down, up, alpha, down_scale, up_scale, offset, size)
