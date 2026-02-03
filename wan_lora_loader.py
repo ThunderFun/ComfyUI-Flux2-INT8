@@ -11,7 +11,6 @@ import math
 from .lora_utils import parse_wan_lora
 
 _object_patches_lock = threading.RLock()
-
 _tensor_hash_lock = threading.Lock()
 
 def _parse_env_int(name, default):
@@ -27,10 +26,16 @@ def _parse_env_bool(name, default="0"):
 
 _ENABLE_CUDA_SYNC = _parse_env_bool("INT8_ENABLE_CUDA_SYNC", "0")
 _CLEAR_CACHE_STRATEGY = os.environ.get("INT8_CLEAR_CACHE", "auto")
-_MAX_LORA_CACHE_SIZE = _parse_env_int("INT8_LORA_CACHE_SIZE", 32)
+_MAX_LORA_CACHE_SIZE = _parse_env_int("INT8_LORA_CACHE_SIZE", 8)
+
+def _aggressive_memory_cleanup():
+    """Aggressive memory cleanup for OOM situations."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 _MAX_FULL_HASH_ELEMENTS = 64
-
 _HASH_SAMPLE_COUNT = 16
 
 def _should_clear_cache():
@@ -230,7 +235,7 @@ def _validate_lora_bounds(offset, size, out_dim, key=""):
 
 
 class LoRAWeightCache:
-    """Thread-safe LRU cache for LoRA weights with reference counting."""
+    """Thread-safe LRU cache for LoRA weights with memory awareness."""
 
     def __init__(self, max_size=_MAX_LORA_CACHE_SIZE):
         self.max_size = max_size
@@ -239,8 +244,48 @@ class LoRAWeightCache:
         self._lock = threading.RLock()
         self._ref_counts = {}
 
+    def _check_memory_pressure(self):
+        """Check if GPU memory is under pressure."""
+        if not torch.cuda.is_available():
+            return False
+        try:
+            free_mem, total_mem = torch.cuda.mem_get_info()
+            return free_mem < total_mem * 0.15
+        except Exception:
+            return False
+
+    def _evict_for_memory(self):
+        """Evict entries to free GPU memory."""
+        evicted = 0
+        for key in list(self._access_order):
+            if self._ref_counts.get(key, 0) == 0:
+                try:
+                    self._access_order.remove(key)
+                except ValueError:
+                    pass
+                if key in self._cache:
+                    value = self._cache.pop(key)
+                    if isinstance(value, dict):
+                        for v in value.values():
+                            if isinstance(v, torch.Tensor):
+                                del v
+                    elif isinstance(value, torch.Tensor):
+                        del value
+                    evicted += 1
+                self._ref_counts.pop(key, None)
+                
+                if evicted >= 2 and not self._check_memory_pressure():
+                    break
+        
+        if evicted > 0:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        return evicted
+
     def get(self, key):
-        """Get cached value. Returns a deep copy of tensor values."""
+        """Get cached value directly (no clone for performance)."""
         with self._lock:
             if key in self._cache:
                 try:
@@ -249,23 +294,15 @@ class LoRAWeightCache:
                     pass
                 self._access_order.append(key)
                 self._ref_counts[key] = self._ref_counts.get(key, 0) + 1
-                value = self._cache[key]
-                if isinstance(value, dict):
-                    result = {}
-                    for k, v in value.items():
-                        if isinstance(v, torch.Tensor):
-                            result[k] = v.detach().clone().contiguous()
-                        else:
-                            result[k] = v
-                    return result
-                elif isinstance(value, torch.Tensor):
-                    return value.detach().clone().contiguous()
-                return value
+                return self._cache[key]
             return None
 
     def get_or_create(self, key, factory_fn):
         """Atomically get existing value or create and cache new one."""
         with self._lock:
+            if self._check_memory_pressure():
+                self._evict_for_memory()
+            
             if key in self._cache:
                 try:
                     self._access_order.remove(key)
@@ -273,19 +310,7 @@ class LoRAWeightCache:
                     pass
                 self._access_order.append(key)
                 self._ref_counts[key] = self._ref_counts.get(key, 0) + 1
-                
-                value = self._cache[key]
-                if isinstance(value, dict):
-                    result = {}
-                    for k, v in value.items():
-                        if isinstance(v, torch.Tensor):
-                            result[k] = v.detach().clone().contiguous()
-                        else:
-                            result[k] = v
-                    return (result, False)
-                elif isinstance(value, torch.Tensor):
-                    return (value.detach().clone().contiguous(), False)
-                return (value, False)
+                return (self._cache[key], False)
             
             if len(self._cache) >= self.max_size:
                 self._evict_oldest()
@@ -296,16 +321,6 @@ class LoRAWeightCache:
             self._access_order.append(key)
             self._ref_counts[key] = 1
             
-            if isinstance(value, dict):
-                result = {}
-                for k, v in value.items():
-                    if isinstance(v, torch.Tensor):
-                        result[k] = v.detach().clone().contiguous()
-                    else:
-                        result[k] = v
-                return (result, True)
-            elif isinstance(value, torch.Tensor):
-                return (value.detach().clone().contiguous(), True)
             return (value, True)
 
     def release(self, key):
@@ -315,68 +330,55 @@ class LoRAWeightCache:
                 self._ref_counts[key] -= 1
                 if self._ref_counts[key] <= 0:
                     del self._ref_counts[key]
-
-    def set(self, key, value, initial_ref_count=0):
-        """Set cached value with optional initial reference count."""
-        with self._lock:
-            if key in self._cache:
-                self._cache[key] = value
-                try:
-                    self._access_order.remove(key)
-                except ValueError:
-                    pass
-                self._access_order.append(key)
-                if initial_ref_count > 0:
-                    self._ref_counts[key] = self._ref_counts.get(key, 0) + initial_ref_count
-            else:
-                if len(self._cache) >= self.max_size:
-                    self._evict_oldest()
-                self._cache[key] = value
-                self._access_order.append(key)
-                if initial_ref_count > 0:
-                    self._ref_counts[key] = initial_ref_count
+                    if self._check_memory_pressure() and key in self._cache:
+                        try:
+                            self._access_order.remove(key)
+                        except ValueError:
+                            pass
+                        value = self._cache.pop(key, None)
+                        if value is not None:
+                            if isinstance(value, dict):
+                                for v in value.values():
+                                    if isinstance(v, torch.Tensor):
+                                        del v
+                            elif isinstance(value, torch.Tensor):
+                                del value
 
     def _evict_oldest(self):
         """Evict oldest entry with zero reference count."""
-        evicted = False
-        for i, key in enumerate(list(self._access_order)):
+        for key in list(self._access_order):
             if self._ref_counts.get(key, 0) == 0:
                 self._access_order.remove(key)
                 if key in self._cache:
                     self._cache.pop(key)
-                evicted = True
-                break
-        
-        if not evicted and len(self._cache) >= self.max_size:
-            import warnings
-            warnings.warn(
-                f"LoRA weight cache at capacity ({self.max_size}) with all entries in use. "
-                "Consider increasing INT8_LORA_CACHE_SIZE environment variable.",
-                ResourceWarning,
-                stacklevel=3
-            )
-
-    def _release_value(self, value):
-        """Release value references when evicting from cache."""
-        pass
+                return True
+        return False
 
     def clear(self):
         """Clear cache entries with zero reference count."""
         with self._lock:
-            keys_to_evict = []
-            for key in self._access_order:
-                if self._ref_counts.get(key, 0) == 0:
-                    keys_to_evict.append(key)
+            keys_to_evict = [k for k in self._access_order
+                            if self._ref_counts.get(k, 0) == 0]
             
             for key in keys_to_evict:
                 if key in self._cache:
                     value = self._cache.pop(key)
-                    self._release_value(value)
+                    if isinstance(value, dict):
+                        for v in value.values():
+                            if isinstance(v, torch.Tensor):
+                                del v
+                    elif isinstance(value, torch.Tensor):
+                        del value
                 try:
                     self._access_order.remove(key)
                 except ValueError:
                     pass
                 self._ref_counts.pop(key, None)
+            
+            if keys_to_evict:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
 
 class LoRAWrapperModule(torch.nn.Module):
@@ -388,7 +390,6 @@ class LoRAWrapperModule(torch.nn.Module):
         self._getting_attr = threading.local()
         self._getattr_lock = threading.Lock()
         
-        # Store as a submodule so PyTorch can find it
         self._wrapped_module = wrapped_module
         self.lora_patches = lora_patches_list if lora_patches_list is not None else []
         self._lora_weight_cache = LoRAWeightCache(_MAX_LORA_CACHE_SIZE)
@@ -397,23 +398,36 @@ class LoRAWrapperModule(torch.nn.Module):
 
     def __setstate__(self, state):
         """Restore object state from pickle, handling backwards compatibility."""
-        # Handle old pickles that have 'wrapped_module' instead of '_wrapped_module'
+        torch.nn.Module.__init__(self)
+        
         if 'wrapped_module' in state and '_wrapped_module' not in state:
             state['_wrapped_module'] = state.pop('wrapped_module')
-        # Handle case where neither exists (shouldn't happen, but be safe)
+        
         if '_wrapped_module' not in state:
             state['_wrapped_module'] = None
-        # Restore threading locals and locks (can't be pickled)
-        state['_getting_attr'] = threading.local()
-        state['_getattr_lock'] = threading.Lock()
-        state['_patch_ids_lock'] = threading.Lock()
-        # Restore the cache
-        state['_lora_weight_cache'] = LoRAWeightCache(_MAX_LORA_CACHE_SIZE)
+        
+        wrapped = state.pop('_wrapped_module', None)
+        lora_patches = state.pop('lora_patches', [])
+        
+        state.pop('_getting_attr', None)
+        state.pop('_getattr_lock', None)
+        state.pop('_patch_ids_lock', None)
+        state.pop('_lora_weight_cache', None)
+        state.pop('_last_patch_ids', None)
+        
         self.__dict__.update(state)
+        
+        self._wrapped_module = wrapped
+        self.lora_patches = lora_patches
+        
+        self._getting_attr = threading.local()
+        self._getattr_lock = threading.Lock()
+        self._patch_ids_lock = threading.Lock()
+        self._lora_weight_cache = LoRAWeightCache(_MAX_LORA_CACHE_SIZE)
+        self._last_patch_ids = None
 
     @property
     def wrapped_module(self):
-        # Backwards compatibility: check both old and new attribute names
         if '_wrapped_module' in self.__dict__:
             return self.__dict__['_wrapped_module']
         if 'wrapped_module' in self.__dict__:
@@ -427,7 +441,7 @@ class LoRAWrapperModule(torch.nn.Module):
     @property
     def weight(self):
         """Expose weight directly for ComfyUI compatibility."""
-        wrapped = self.wrapped_module  # Use property for backwards compatibility
+        wrapped = self.wrapped_module
         if wrapped is not None and hasattr(wrapped, 'weight'):
             return wrapped.weight
         raise AttributeError("wrapped module has no weight")
@@ -435,17 +449,18 @@ class LoRAWrapperModule(torch.nn.Module):
     @property
     def bias(self):
         """Expose bias directly for ComfyUI compatibility."""
-        wrapped = self.wrapped_module  # Use property for backwards compatibility
+        wrapped = self.wrapped_module
         if wrapped is not None and hasattr(wrapped, 'bias'):
             return wrapped.bias
         return None
 
     def __deepcopy__(self, memo):
         """Custom deepcopy that handles threading.local() and locks."""
-        new_instance = self.__class__.__new__(self.__class__)
+        new_instance = object.__new__(self.__class__)
         memo[id(self)] = new_instance
         
-        # Use property for backwards compatibility with old objects
+        torch.nn.Module.__init__(new_instance)
+        
         wrapped = self.wrapped_module
         if wrapped is not None:
             new_instance._wrapped_module = copy.deepcopy(wrapped, memo)
@@ -459,9 +474,18 @@ class LoRAWrapperModule(torch.nn.Module):
         new_instance._patch_ids_lock = threading.Lock()
         
         new_instance._lora_weight_cache = LoRAWeightCache(_MAX_LORA_CACHE_SIZE)
-        new_instance._last_patch_ids = self._last_patch_ids
+        new_instance._last_patch_ids = None
         
         return new_instance
+
+    def __reduce__(self):
+        """Support proper pickling by providing reconstruction info."""
+        wrapped = self.wrapped_module
+        patches = self.lora_patches
+        return (
+            self.__class__,
+            (wrapped, patches),
+        )
 
     def _is_getting_attr(self, name):
         """Check if we're already getting this attribute (per-thread)."""
@@ -485,14 +509,11 @@ class LoRAWrapperModule(torch.nn.Module):
             pass
 
     def __getattr__(self, name):
-        # Handle access to wrapped_module attributes when they don't exist (backwards compatibility)
         if name in ('_wrapped_module', 'wrapped_module'):
-            # Check all possible locations
             if '_wrapped_module' in self.__dict__:
                 return self.__dict__['_wrapped_module']
             if 'wrapped_module' in self.__dict__:
                 return self.__dict__['wrapped_module']
-            # Check if stored as a submodule by PyTorch
             if '_modules' in self.__dict__:
                 if 'wrapped_module' in self._modules:
                     return self._modules['wrapped_module']
@@ -500,11 +521,9 @@ class LoRAWrapperModule(torch.nn.Module):
                     return self._modules['_wrapped_module']
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
         
-        # Check if we have _getting_attr initialized
         try:
             getting_attr = object.__getattribute__(self, '_getting_attr')
         except AttributeError:
-            # Fallback during initialization
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
         
         if self._is_getting_attr(name):
@@ -512,7 +531,6 @@ class LoRAWrapperModule(torch.nn.Module):
         
         self._add_getting_attr(name)
         try:
-            # Try to get from wrapped module (check both old and new attribute names)
             wrapped = None
             if '_wrapped_module' in self.__dict__:
                 wrapped = self.__dict__['_wrapped_module']
@@ -548,7 +566,6 @@ class LoRAWrapperModule(torch.nn.Module):
             del self._buffers[name]
             return
         
-        # Use property for backwards compatibility
         try:
             wrapped = self.wrapped_module
         except AttributeError:
@@ -563,7 +580,6 @@ class LoRAWrapperModule(torch.nn.Module):
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def forward(self, x):
-        # Use property for backwards compatibility with old objects
         wrapped = self.wrapped_module
         original_out = wrapped(x)
         
@@ -572,9 +588,9 @@ class LoRAWrapperModule(torch.nn.Module):
             return original_out
 
         try:
-            from .int8_quant import chunked_int8_lora_forward, chunked_lora_forward, CHUNK_THRESHOLD_ELEMENTS
+            from .int8_quant import chunked_int8_lora_forward, chunked_lora_forward
         except ImportError as e:
-            print(f"ERROR: Failed to import int8_quant module: {e}. LoRA will not be applied.")
+            print(f"ERROR: Failed to import int8_quant module: {e}")
             return original_out
 
         with self._patch_ids_lock:
@@ -595,7 +611,6 @@ class LoRAWrapperModule(torch.nn.Module):
         try:
             for patch_data in patches:
                 if not isinstance(patch_data, (list, tuple)):
-                    print(f"Warning: Invalid patch_data type: {type(patch_data)}")
                     continue
 
                 patch_len = len(patch_data)
@@ -609,23 +624,18 @@ class LoRAWrapperModule(torch.nn.Module):
                 elif patch_len == 7:
                     d, u, a, d_scale, u_scale, offset, size = patch_data
                 else:
-                    print(f"Warning: Unexpected patch_data length: {patch_len}")
                     continue
 
                 if not all(isinstance(t, torch.Tensor) for t in [d, u]):
-                    print(f"Warning: Expected d and u to be tensors")
                     continue
 
                 if not _is_valid_alpha(a):
-                    if not _is_zero_alpha(a):
-                        print(f"Warning: Invalid alpha value ({a}), skipping patch")
                     continue
 
                 is_int8 = d.dtype == torch.int8 and u.dtype == torch.int8
                 expected_input_dim = d.shape[1]
                 
                 if expected_input_dim != x_2d.shape[-1]:
-                    print(f"Warning: Shape mismatch: d.shape={d.shape}, x_2d.shape={x_2d.shape}")
                     continue
 
                 offset, size, is_valid = _validate_lora_bounds(
@@ -635,11 +645,9 @@ class LoRAWrapperModule(torch.nn.Module):
                 if not is_valid:
                     continue
 
-                # KEY FIX: Lazy clone - only clone when we have a valid patch to apply
                 if out is None:
-                    # Check if we can modify in-place (no gradient required)
                     if not original_out.requires_grad and original_out.is_contiguous():
-                        out = original_out  # Use directly, no clone
+                        out = original_out
                     else:
                         out = original_out.clone()
                 
@@ -654,10 +662,10 @@ class LoRAWrapperModule(torch.nn.Module):
                         
                         def create_int8_cache():
                             return {
-                                'd': d.to(device=original_out.device, non_blocking=False),
-                                'u': u.to(device=original_out.device, non_blocking=False),
-                                'd_scale': d_scale.to(device=original_out.device, non_blocking=False) if isinstance(d_scale, torch.Tensor) else d_scale,
-                                'u_scale': u_scale.to(device=original_out.device, non_blocking=False) if isinstance(u_scale, torch.Tensor) else u_scale,
+                                'd': d.to(device=original_out.device, non_blocking=True),
+                                'u': u.to(device=original_out.device, non_blocking=True),
+                                'd_scale': d_scale.to(device=original_out.device, non_blocking=True) if isinstance(d_scale, torch.Tensor) else d_scale,
+                                'u_scale': u_scale.to(device=original_out.device, non_blocking=True) if isinstance(u_scale, torch.Tensor) else u_scale,
                             }
 
                         cached, _ = self._lora_weight_cache.get_or_create(cache_key, create_int8_cache)
@@ -670,7 +678,7 @@ class LoRAWrapperModule(torch.nn.Module):
                         )
                         any_patch_applied = True
                     else:
-                        curr_x = x_2d.to(dtype=original_out.dtype) if x_2d.dtype != original_out.dtype else x_2d
+                        curr_x = x_2d if x_2d.dtype == original_out.dtype else x_2d.to(dtype=original_out.dtype)
 
                         cache_key = (
                             "float",
@@ -680,8 +688,8 @@ class LoRAWrapperModule(torch.nn.Module):
 
                         def create_float_cache():
                             return {
-                                'd': d.to(device=original_out.device, dtype=original_out.dtype, non_blocking=False),
-                                'u': u.to(device=original_out.device, dtype=original_out.dtype, non_blocking=False),
+                                'd': d.to(device=original_out.device, dtype=original_out.dtype, non_blocking=True),
+                                'u': u.to(device=original_out.device, dtype=original_out.dtype, non_blocking=True),
                             }
 
                         cached, _ = self._lora_weight_cache.get_or_create(cache_key, create_float_cache)
@@ -694,17 +702,13 @@ class LoRAWrapperModule(torch.nn.Module):
                         any_patch_applied = True
                 
                 except Exception as e:
-                    print(f"Error computing LoRA patch contribution: {e}")
+                    print(f"Error computing LoRA patch: {e}")
                     continue
 
-            # KEY FIX: Return appropriate tensor without keeping extra references
             if out is not None and any_patch_applied:
-                if out is original_out:
-                    return out
-                else:
-                    # Delete original to free memory before returning
+                if out is not original_out:
                     del original_out
-                    return out
+                return out
             else:
                 if out is not None and out is not original_out:
                     del out
@@ -741,6 +745,12 @@ class WanLoRALoader:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+            free_mem, total_mem = torch.cuda.mem_get_info()
+            if free_mem < total_mem * 0.1:
+                print(f"Warning: Low GPU memory ({free_mem / 1e9:.2f}GB free). "
+                      f"Consider reducing resolution or batch size.")
 
         if strength == 0:
             return (model,)
@@ -782,11 +792,25 @@ class WanLoRALoader:
                     for key, value in list(original_patches.items()):
                         if isinstance(value, LoRAWrapperModule):
                             value._lora_weight_cache.clear()
-                        try:
-                            new_object_patches[key] = copy.deepcopy(value)
-                        except Exception as e:
-                            print(f"Warning: Failed to deepcopy patch {key}: {e}")
-                            new_object_patches[key] = value
+                            
+                            try:
+                                new_object_patches[key] = copy.deepcopy(value)
+                            except Exception as e:
+                                print(f"Warning: Rebuilding patch {key} due to deepcopy failure: {e}")
+                                try:
+                                    wrapped = value.wrapped_module
+                                    patches = list(value.lora_patches) if value.lora_patches else []
+                                    new_wrapper = LoRAWrapperModule(wrapped, patches)
+                                    new_object_patches[key] = new_wrapper
+                                except Exception as e2:
+                                    print(f"Error: Could not rebuild patch {key}: {e2}")
+                                    new_object_patches[key] = value
+                        else:
+                            try:
+                                new_object_patches[key] = copy.deepcopy(value)
+                            except Exception as e:
+                                print(f"Warning: Failed to deepcopy patch {key}: {e}")
+                                new_object_patches[key] = value
                     
                     new_model.object_patches = new_object_patches
 
@@ -794,7 +818,6 @@ class WanLoRALoader:
             modules = dict(torch_model.named_modules())
 
             patched_count = 0
-            
             patches_to_apply = []
 
             for key in lora_weights.weights:
@@ -928,24 +951,20 @@ class WanLoRALoader:
 
                 new_patch_list = current_patches + [patch_tuple]
 
-                # Safely determine the raw module to wrap
                 raw_module = target_module
                 
-                # Unwrap if target_module is already a LoRAWrapperModule
                 if isinstance(raw_module, LoRAWrapperModule):
-                    raw_module = raw_module.wrapped_module  # Use property
+                    raw_module = raw_module.wrapped_module
                 
-                # Check object_patches for existing wrapper
                 if target_key in new_model.object_patches:
                     existing = new_model.object_patches[target_key]
                     if isinstance(existing, LoRAWrapperModule):
-                        raw_module = existing.wrapped_module  # Use property
+                        raw_module = existing.wrapped_module
                     elif isinstance(existing, torch.nn.Linear):
                         raw_module = existing
                 
-                # Final safety: ensure we're not wrapping a wrapper
                 while isinstance(raw_module, LoRAWrapperModule):
-                    raw_module = raw_module.wrapped_module  # Use property
+                    raw_module = raw_module.wrapped_module
 
                 wrapper = LoRAWrapperModule(raw_module, new_patch_list)
                 wrappers_to_add.append((target_key, wrapper))

@@ -32,7 +32,7 @@ The following pre-quantized models are available and functional:
 |-------|--------|-------|
 | Wan 2.2 | ✅ Tested | Full support with LoRA |
 | Flux 2 | ✅ Supported | Excludes embedding layers from quantization |
-| Z-Image | ✅ Supported | Includes Diffusers format conversion ⚠️ **CLIP LoRA loader is currently broken** |
+| Z-Image | ✅ Supported | Includes Diffusers format conversion |
 
 ### INT8 Quantization
 QuIP quantization is recommended because it typically offers high precision and tends to work well with LoRA adapters, primarily when applied to transformer-based models. Use the [convert_to_quant_QuIP_INT8](https://github.com/ThunderFun/convert_to_quant_QuIP_INT8) project to quantize your models.
