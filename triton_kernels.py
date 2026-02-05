@@ -7,10 +7,6 @@ import gc
 from typing import Optional
 import os
 
-# =============================================================================
-# GPU Architecture Detection
-# =============================================================================
-
 def gpu_cc(device=None):
     """Get GPU compute capability as integer (e.g., 86, 89, 75)."""
     if device is None:
@@ -88,21 +84,13 @@ def pick_gemm_kernel_with_logging(device=None):
 pick_gemm_kernel = pick_gemm_kernel_with_logging
 
 
-# =============================================================================
 # Hadamard QuIP Kernel Implementation
-# =============================================================================
-# Based on QuIP (Quantization with Incoherence Processing) paper.
-# Uses Hadamard matrices instead of learned U/V rotations for INT8 quantization.
-#
-# Formula: W = H @ W_q @ H.T where H is Hadamard matrix (no storage needed)
-# With random sign flips: W = D1 @ H @ W_q @ H.T @ D2
-# =============================================================================
+# Based on QuIP paper - uses Hadamard transforms for INT8 quantization.
+# Formula: W = D1 @ H @ W_q @ H.T @ D2 (H is self-inverse, no storage needed)
 
 _HADAMARD_DIAGNOSTICS = os.environ.get("HADAMARD_DIAGNOSTICS", "0") == "1"
 
-# =============================================================================
 # Helper Functions
-# =============================================================================
 
 _HADAMARD_CHUNK_SIZE = int(os.environ.get("HADAMARD_CHUNK_SIZE", "2048"))
 
@@ -182,9 +170,7 @@ def _safe_contiguous_clone(x: torch.Tensor, verbose: bool = False) -> torch.Tens
             return x.clone()
 
 
-# =============================================================================
 # Kernel 3: Fast Walsh-Hadamard Transform (FWHT)
-# =============================================================================
 
 @triton.jit
 def _hadamard_stage_kernel(
@@ -390,7 +376,6 @@ def triton_hadamard_transform(
                 print(f"[DIAG HADAMARD] Allocated: {allocated:.2f}GB / {total:.2f}GB")
             raise
     
-        # This prevents race conditions between tensor preparation and Triton kernel execution
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     
@@ -476,10 +461,8 @@ def fast_hadamard_transform_2d(
     
     return x
 
+# Kernel: Fused Row-wise Quantization (FP16/BF16 -> INT8 + Scale)
 
-# =============================================================================
-# Kernel 1: Fused Row-wise Quantization (FP16/BF16 -> INT8 + Scale)
-# =============================================================================
 
 @triton.jit
 def _quantize_rowwise_kernel(
@@ -540,14 +523,8 @@ def triton_quantize_rowwise(x: torch.Tensor):
     return y, s.reshape(-1).contiguous().to(torch.float32)
 
 
-# =============================================================================
-# Kernel 2: INT8 GEMM + Fused Dequantization Epilogue
-# =============================================================================
-
-# NOTE: Autotune removed due to correctness issues with large matrices.
-# The autotune decorator selected configs that worked for small matrices
-# but produced incorrect results for large matrices (e.g., 311x3072x27648).
-# Using a fixed, safe configuration that works for all sizes.
+# Kernel: INT8 GEMM + Fused Dequantization Epilogue
+# Uses fixed config - autotune was removed due to correctness issues with large matrices.
 
 _FIXED_BLOCK_M = 128
 _FIXED_BLOCK_N = 128
@@ -605,7 +582,7 @@ def _int8_matmul_dequant_kernel(
         b_ptrs += BLOCK_K * stride_bk
 
     # Fused Epilogue (Dequantize & Bias)
-        scale_a = tl.load(a_scale_ptr + offs_am, mask=offs_am < M, other=1.0)
+    scale_a = tl.load(a_scale_ptr + offs_am, mask=offs_am < M, other=1.0)
     
     if HAS_PER_CHANNEL_SCALE:
         scale_b = tl.load(b_scale_ptr + offs_bn, mask=offs_bn < N, other=1.0)
@@ -626,17 +603,10 @@ def _int8_matmul_dequant_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-# =============================================================================
-# Ampere-Tuned INT8 GEMM Kernel (FIXED CONFIGURATION)
-# =============================================================================
-# Optimized for Ampere architecture (SM80/86) - RTX 30xx, A100
-# Uses larger BK=64 and more warps for better int8 dot performance
-# B matrix is packed as [K, N] for direct tl.dot(a, b) without transpose
-#
-# NOTE: Autotune removed due to correctness issues with large matrices.
-# Using a fixed, safe configuration that works for all sizes.
+# Ampere-Tuned INT8 GEMM Kernel
+# Optimized for Ampere (SM80/86) - larger BK=64, more warps for int8 dot performance.
+# B matrix is packed as [K, N] for direct tl.dot without transpose.
 
-# Fixed Ampere-optimized configuration
 _AMPERE_BLOCK_M = 128
 _AMPERE_BLOCK_N = 128
 _AMPERE_BLOCK_K = 64
@@ -712,9 +682,9 @@ def _int8_gemm_dequant_ampere(
         B = tl.advance(B, (BK, 0))
 
     # Fused epilogue: dequantize, apply bias
-    a_s = tl.load(a_scale_ptr + offs_m, mask=offs_m < M, other=0.0).to(tl.float32)
+    a_s = tl.load(a_scale_ptr + offs_m, mask=offs_m < M, other=1.0).to(tl.float32)
     if HAS_PER_CHANNEL_SCALE:
-        b_s = tl.load(b_scale_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
+        b_s = tl.load(b_scale_ptr + offs_n, mask=offs_n < N, other=1.0).to(tl.float32)
     else:
         b_s = tl.load(b_scale_ptr).to(tl.float32)
 
@@ -844,7 +814,6 @@ def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias
     return output.reshape(x_shape_orig[:-1] + (N,))
 
 
-# =============================================================================
 def triton_hadamard_quip_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -915,10 +884,26 @@ def triton_hadamard_quip_linear(
         if hadamard_size_out > 0 and hadamard_size_in > 0:
             N_orig, K_orig = weight.shape
             if N_orig != hadamard_size_out or K_orig != hadamard_size_in:
+                # Pad weight dimensions
                 if N_orig < hadamard_size_out:
                     weight = torch.nn.functional.pad(weight, (0, 0, 0, hadamard_size_out - N_orig))
+                    # CRITICAL: Also pad weight_scale to match padded weight dimensions
+                    if isinstance(weight_scale, torch.Tensor) and weight_scale.numel() > 1:
+                        if weight_scale.numel() == N_orig:
+                            # Pad scale vector with small epsilon to avoid division issues
+                            pad_size = hadamard_size_out - N_orig
+                            # Use the last scale value for padding (better than zeros)
+                            last_scale = weight_scale[-1].item() if weight_scale.numel() > 0 else 1e-30
+                            weight_scale = torch.cat([
+                                weight_scale.reshape(-1),
+                                torch.full((pad_size,), last_scale, dtype=weight_scale.dtype, device=weight_scale.device)
+                            ])
+                
                 if K_orig < hadamard_size_in:
                     weight = torch.nn.functional.pad(weight, (0, hadamard_size_in - K_orig, 0, 0))
+                
+                # Update N to reflect padded dimensions
+                N = weight.shape[0]
         
         if sign_row is not None and hadamard_size_out > 0:
             assert sign_row.shape[0] >= hadamard_size_out, \
@@ -928,9 +913,9 @@ def triton_hadamard_quip_linear(
             assert sign_col.shape[0] >= hadamard_size_in, \
                 f"sign_col length ({sign_col.shape[0]}) must be >= hadamard_size_in ({hadamard_size_in})"
         
-        if weight_scale.numel() > 1:
+        if isinstance(weight_scale, torch.Tensor) and weight_scale.numel() > 1:
             assert weight_scale.numel() == N, \
-                f"Per-channel weight_scale length ({weight_scale.numel()}) must match weight output dim ({N})"
+                f"Per-channel weight_scale length ({weight_scale.numel()}) must match weight output dim ({N}) after padding"
     
     # Chunked processing for large batches to prevent OOM
     global _HADAMARD_CHUNK_SIZE
@@ -965,8 +950,9 @@ def triton_hadamard_quip_linear(
         output = torch.cat(output_chunks, dim=0)
         del output_chunks
         
+        # Add bias in the correct dtype (output might be FP32 for LoRA accumulation)
         if bias is not None:
-            output = output + bias.to(compute_dtype)
+            output = output + bias.to(output.dtype)
         
         return output.reshape(x_shape_orig[:-1] + (output.shape[1],))
     
@@ -1007,8 +993,12 @@ def triton_hadamard_quip_linear(
     else:
         weight_scale = weight_scale.reshape(-1).contiguous()
     
-        has_bias = bias is not None
-    bias_ptr = bias if has_bias else x
+    # For Hadamard-QuIP: disable bias in GEMM when output transform is needed
+    # Bias will be added ONCE at the end, in the correct space
+    has_output_hadamard = hadamard_size_out > 0 and is_power_of_two(hadamard_size_out)
+    fused_bias = bias if not has_output_hadamard else None
+    has_bias = fused_bias is not None
+    bias_ptr = fused_bias if has_bias else x
     has_per_channel_scale = weight_scale.numel() > 1
     
     # Select kernel based on GPU architecture
@@ -1025,16 +1015,14 @@ def triton_hadamard_quip_linear(
     else:
         out_tl = tl.float32
     
-        actual_K = x_int8.shape[1]
+    actual_K = x_int8.shape[1]
     weight_K = weight.shape[1]
     if actual_K != weight_K:
         if _HADAMARD_DIAGNOSTICS:
             print(f"[DIAG SHAPE MISMATCH] x_int8 K={actual_K}, weight K={weight_K}")
-        # Pad x_int8 to match weight K if needed
         if actual_K < weight_K:
             x_int8 = torch.nn.functional.pad(x_int8, (0, weight_K - actual_K))
             actual_K = weight_K
-        # Or use the smaller K for the kernel
         elif actual_K > weight_K:
             x_int8 = x_int8[:, :weight_K]
             actual_K = weight_K
@@ -1108,15 +1096,15 @@ def triton_hadamard_quip_linear(
         else:
             output = output_hadamard
     
-    if bias is not None:
-        output = output + bias.to(compute_dtype)
+    # Add bias ONCE at the very end, in the original output space
+    # (after inverse Hadamard transform and sign application)
+    if bias is not None and has_output_hadamard:
+        output = output + bias.to(output.dtype)
     
     return output.reshape(x_shape_orig[:-1] + (output.shape[1],))
 
 
-# =============================================================================
 # PyTorch Fallback for Hadamard-QuIP (when Triton not available)
-# =============================================================================
 
 def pytorch_hadamard_quip_linear(
     x: torch.Tensor,
@@ -1130,7 +1118,16 @@ def pytorch_hadamard_quip_linear(
     sign_col: Optional[torch.Tensor] = None,
     out_features: Optional[int] = None,
 ) -> torch.Tensor:
-    """PyTorch fallback for Hadamard-QuIP linear layer."""
+    """
+    PyTorch fallback for Hadamard-QuIP linear layer.
+    
+    IMPORTANT: This function assumes `weight` is in Hadamard domain (W_q),
+    NOT spatial domain. This matches the Triton implementation which computes:
+        y = FWHT( matmul( FWHT(x * sign_col), W_q^T ) ) * sign_row
+    
+    If you have a weight in spatial domain W = H @ W_q @ H, you must convert
+    it to Hadamard domain before calling this function.
+    """
     x_shape_orig = x.shape
     x_2d = x.reshape(-1, x_shape_orig[-1])
     
@@ -1144,7 +1141,8 @@ def pytorch_hadamard_quip_linear(
     else:
         original_N = None
     
-    # Apply Hadamard transform if specified
+    # Apply Hadamard transform to input if specified
+    # This transforms x from spatial domain to Hadamard domain
     if hadamard_size_in > 0 and is_power_of_two(hadamard_size_in):
         if K < hadamard_size_in:
             pad_size = hadamard_size_in - K
@@ -1161,11 +1159,11 @@ def pytorch_hadamard_quip_linear(
     else:
         x_for_matmul = x_2d
     
-    # Dequantize weight and compute
+    # Weight is in Hadamard domain (W_q) - dequantize and matmul in Hadamard space
     w_float = weight.float() * weight_scale
     output = torch.matmul(x_for_matmul.to(compute_dtype), w_float.T.to(compute_dtype))
     
-    # Apply inverse Hadamard to output
+    # Apply inverse Hadamard to output (transform back to spatial domain)
     if hadamard_size_out > 0 and is_power_of_two(hadamard_size_out):
         if N < hadamard_size_out:
             pad_size = hadamard_size_out - N
@@ -1189,7 +1187,7 @@ def pytorch_hadamard_quip_linear(
             output = output_hadamard
     
     if bias is not None:
-        output = output + bias.to(compute_dtype)
+        output = output + bias.to(output.dtype)
     
     return output.reshape(x_shape_orig[:-1] + (output.shape[1],))
 
@@ -1229,9 +1227,7 @@ def _pytorch_fwht(x: torch.Tensor) -> torch.Tensor:
     return result
 
 
-# =============================================================================
 # Kernel Numerical Accuracy Tests
-# =============================================================================
 
 @torch.no_grad()
 def ref_int8_linear(x_int8, x_scale, w_int8, w_scale, out_dtype=torch.float32):

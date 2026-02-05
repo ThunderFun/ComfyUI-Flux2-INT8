@@ -45,6 +45,16 @@ class WanVideoINT8Loader:
         import gc
         from comfy.sd import load_diffusion_model
         from . import int8_quant
+        from .int8_quant import strip_comfy_quant_keys
+        
+        # Guard: Ensure Int8TensorwiseOps imported successfully
+        if Int8TensorwiseOps is None:
+            raise RuntimeError(
+                "Int8TensorwiseOps failed to import. "
+                "Check console for the underlying ImportError. "
+                "Common causes: missing dependencies (e.g., torch, numpy), "
+                "or errors in int8_quant.py."
+            )
         
         is_debug = debug_mode
         Int8TensorwiseOps.debug_mode = is_debug
@@ -107,13 +117,17 @@ class WanVideoINT8Loader:
             
             if isinstance(result, tuple):
                 sd, metadata = result
+                # Strip .comfy_quant metadata keys for all models to prevent warnings
+                sd = strip_comfy_quant_keys(sd)
                 if is_diffusers_zimage_format(sd):
                     if is_debug:
                         print("[z-image] Diffusers format detected in tuple, converting...")
                     return convert_zimage_diffusers_state_dict(sd), metadata
-                return result
+                return sd, metadata
             
             sd = result
+            # Strip .comfy_quant metadata keys for all models to prevent warnings
+            sd = strip_comfy_quant_keys(sd)
             if is_diffusers_zimage_format(sd):
                 if is_debug:
                     print("[z-image] Diffusers format detected, converting...")

@@ -58,58 +58,11 @@ def _should_clear_cache():
     return True
 
 
-def _get_tensor_content_hash(t, full_hash_threshold=1024*1024):
-    """Get a stable hash for tensor identity based on content."""
+def _get_tensor_content_hash(t):
+    """Get a stable hash for tensor identity based on storage properties."""
     if not isinstance(t, torch.Tensor):
         return (id(t),)
-
-    shape_str = str(t.shape)
-    dtype_str = str(t.dtype)
-    numel = t.numel()
-    
-    if numel == 0:
-        return (shape_str, dtype_str, 0)
-
-    if _ENABLE_CUDA_SYNC and torch.cuda.is_available() and t.is_cuda:
-        torch.cuda.synchronize(t.device)
-
-    with _tensor_hash_lock:
-        try:
-            flat = t.flatten().detach()
-            tensor_bytes = numel * t.element_size()
-            
-            if tensor_bytes <= full_hash_threshold:
-                cpu_tensor = flat.cpu()
-                content_bytes = cpu_tensor.numpy().tobytes()
-                content_hash = hashlib.sha256(content_bytes).hexdigest()
-                return (shape_str, dtype_str, numel, content_hash)
-            else:
-                num_samples = min(256, numel)
-                
-                bucket_size = numel // num_samples
-                indices = []
-                for i in range(num_samples):
-                    idx = i * bucket_size + bucket_size // 2
-                    indices.append(min(idx, numel - 1))
-                
-                indices.extend([0, numel - 1, numel // 2, numel // 4, 3 * numel // 4])
-                indices = sorted(set(indices))
-                
-                sample = flat[indices].cpu()
-                sample_bytes = sample.numpy().tobytes()
-                sample_hash = hashlib.sha256(sample_bytes).hexdigest()
-                
-                flat_f64 = flat.to(torch.float64)
-                tensor_sum = float(flat_f64.sum().item())
-                tensor_abs_sum = float(flat_f64.abs().sum().item())
-                tensor_min = float(flat_f64.min().item())
-                tensor_max = float(flat_f64.max().item())
-                
-                return (shape_str, dtype_str, numel, sample_hash,
-                        tensor_sum, tensor_abs_sum, tensor_min, tensor_max)
-                
-        except Exception as e:
-            return (shape_str, dtype_str, numel, id(t), "fallback", str(type(e).__name__))
+    return (t.shape, t.dtype, t.device, t.data_ptr(), t.storage_offset())
 
 
 def _get_patch_identity(patches):
@@ -345,7 +298,7 @@ class LoRAWeightCache:
                                 del value
 
     def _evict_oldest(self):
-        """Evict oldest entry with zero reference count."""
+        """Evict oldest entry with zero reference count. Caller must hold self._lock."""
         for key in list(self._access_order):
             if self._ref_counts.get(key, 0) == 0:
                 self._access_order.remove(key)
@@ -416,8 +369,7 @@ class LoRAWrapperModule(torch.nn.Module):
         state.pop('_last_patch_ids', None)
         
         self.__dict__.update(state)
-        
-        self._wrapped_module = wrapped
+        self.wrapped_module = wrapped
         self.lora_patches = lora_patches
         
         self._getting_attr = threading.local()
@@ -440,7 +392,7 @@ class LoRAWrapperModule(torch.nn.Module):
 
     @property
     def weight(self):
-        """Expose weight directly for ComfyUI compatibility."""
+        """Expose weight for ComfyUI compatibility."""
         wrapped = self.wrapped_module
         if wrapped is not None and hasattr(wrapped, 'weight'):
             return wrapped.weight
@@ -448,7 +400,7 @@ class LoRAWrapperModule(torch.nn.Module):
 
     @property
     def bias(self):
-        """Expose bias directly for ComfyUI compatibility."""
+        """Expose bias for ComfyUI compatibility."""
         wrapped = self.wrapped_module
         if wrapped is not None and hasattr(wrapped, 'bias'):
             return wrapped.bias
@@ -488,21 +440,21 @@ class LoRAWrapperModule(torch.nn.Module):
         )
 
     def _is_getting_attr(self, name):
-        """Check if we're already getting this attribute (per-thread)."""
-        try:
-            return name in self._getting_attr.set
-        except AttributeError:
+        """Check if attribute is being accessed (per-thread recursion guard)."""
+        if not hasattr(self._getting_attr, 'set'):
+            self._getting_attr.set = set()
             return False
+        return name in self._getting_attr.set
 
     def _add_getting_attr(self, name):
-        """Add to getting_attr set (per-thread)."""
+        """Add attribute to recursion guard set."""
         try:
             self._getting_attr.set.add(name)
         except AttributeError:
             self._getting_attr.set = {name}
 
     def _remove_getting_attr(self, name):
-        """Remove from getting_attr set (per-thread)."""
+        """Remove attribute from recursion guard set."""
         try:
             self._getting_attr.set.discard(name)
         except AttributeError:
@@ -582,10 +534,6 @@ class LoRAWrapperModule(torch.nn.Module):
     def forward(self, x):
         wrapped = self.wrapped_module
         original_out = wrapped(x)
-        
-        patches = self.lora_patches
-        if not patches:
-            return original_out
 
         try:
             from .int8_quant import chunked_int8_lora_forward, chunked_lora_forward
@@ -594,6 +542,10 @@ class LoRAWrapperModule(torch.nn.Module):
             return original_out
 
         with self._patch_ids_lock:
+            patches = list(self.lora_patches)
+            if not patches:
+                return original_out
+
             current_patch_ids = _get_patch_identity(patches)
             if self._last_patch_ids != current_patch_ids:
                 self._lora_weight_cache.clear()
@@ -604,7 +556,7 @@ class LoRAWrapperModule(torch.nn.Module):
         if not x_2d.is_contiguous():
             x_2d = x_2d.contiguous()
 
-        out = None
+        out = original_out.clone()
         keys_to_release = set()
         any_patch_applied = False
         
@@ -645,12 +597,6 @@ class LoRAWrapperModule(torch.nn.Module):
                 if not is_valid:
                     continue
 
-                if out is None:
-                    if not original_out.requires_grad and original_out.is_contiguous():
-                        out = original_out
-                    else:
-                        out = original_out.clone()
-                
                 try:
                     if is_int8 and d_scale is not None and u_scale is not None:
                         cache_key = (
@@ -660,12 +606,12 @@ class LoRAWrapperModule(torch.nn.Module):
                             offset, size, original_out.shape[-1],
                         )
                         
-                        def create_int8_cache():
+                        def create_int8_cache(d=d, u=u, d_scale=d_scale, u_scale=u_scale, device=original_out.device):
                             return {
-                                'd': d.to(device=original_out.device, non_blocking=True),
-                                'u': u.to(device=original_out.device, non_blocking=True),
-                                'd_scale': d_scale.to(device=original_out.device, non_blocking=True) if isinstance(d_scale, torch.Tensor) else d_scale,
-                                'u_scale': u_scale.to(device=original_out.device, non_blocking=True) if isinstance(u_scale, torch.Tensor) else u_scale,
+                                'd': d.to(device=device, non_blocking=True),
+                                'u': u.to(device=device, non_blocking=True),
+                                'd_scale': d_scale.to(device=device, non_blocking=True) if isinstance(d_scale, torch.Tensor) else d_scale,
+                                'u_scale': u_scale.to(device=device, non_blocking=True) if isinstance(u_scale, torch.Tensor) else u_scale,
                             }
 
                         cached, _ = self._lora_weight_cache.get_or_create(cache_key, create_int8_cache)
@@ -686,10 +632,10 @@ class LoRAWrapperModule(torch.nn.Module):
                             original_out.dtype, offset, size, original_out.shape[-1],
                         )
 
-                        def create_float_cache():
+                        def create_float_cache(d=d, u=u, device=original_out.device, dtype=original_out.dtype):
                             return {
-                                'd': d.to(device=original_out.device, dtype=original_out.dtype, non_blocking=True),
-                                'u': u.to(device=original_out.device, dtype=original_out.dtype, non_blocking=True),
+                                'd': d.to(device=device, dtype=dtype, non_blocking=True),
+                                'u': u.to(device=device, dtype=dtype, non_blocking=True),
                             }
 
                         cached, _ = self._lora_weight_cache.get_or_create(cache_key, create_float_cache)
@@ -705,13 +651,10 @@ class LoRAWrapperModule(torch.nn.Module):
                     print(f"Error computing LoRA patch: {e}")
                     continue
 
-            if out is not None and any_patch_applied:
-                if out is not original_out:
-                    del original_out
+            if any_patch_applied:
                 return out
             else:
-                if out is not None and out is not original_out:
-                    del out
+                del out
                 return original_out
 
         finally:
@@ -761,7 +704,6 @@ class WanLoRALoader:
             return (model,)
 
         print(f"Loading LoRA: {lora_name}")
-        offload_enabled = (offload_to_cpu == "enable")
 
         lora_state_dict = None
         lora_weights = None
@@ -941,7 +883,21 @@ class WanLoRALoader:
                     patch_tuple = (down, up, alpha, down_scale, up_scale, patch_offset, patch_size)
                     patches_to_apply.append((target_key, target_module, patch_tuple))
 
+            def _is_int8_module(module):
+                """Check if module is an INT8 quantized linear layer."""
+                try:
+                    from .int8_quant import Int8TensorwiseOps
+                    return (hasattr(module, '_is_quantized') and
+                            module._is_quantized and
+                            type(module).__name__ == 'Linear' and
+                            hasattr(Int8TensorwiseOps, 'Linear') and
+                            isinstance(module, Int8TensorwiseOps.Linear))
+                except ImportError:
+                    return False
+
             wrappers_to_add = []
+            int8_direct_patches = []
+            
             for target_key, target_module, patch_tuple in patches_to_apply:
                 current_patches = []
                 if target_key in new_model.object_patches:
@@ -966,15 +922,35 @@ class WanLoRALoader:
                 while isinstance(raw_module, LoRAWrapperModule):
                     raw_module = raw_module.wrapped_module
 
-                wrapper = LoRAWrapperModule(raw_module, new_patch_list)
-                wrappers_to_add.append((target_key, wrapper))
+                if _is_int8_module(raw_module):
+                    # Apply patches directly to INT8 module
+                    int8_direct_patches.append((target_key, raw_module, new_patch_list))
+                    if debug:
+                        print(f"[LoRA] Direct INT8 patch for {target_key}")
+                else:
+                    # Use wrapper for non-INT8 modules
+                    wrapper = LoRAWrapperModule(raw_module, new_patch_list)
+                    wrappers_to_add.append((target_key, wrapper))
+                    if debug:
+                        print(f"[LoRA] Wrapper patch for {target_key}")
 
             with _object_patches_lock:
+                for target_key, int8_module, patch_list in int8_direct_patches:
+                    int8_module.lora_patches = patch_list
+                    patched_count += 1
+                    if target_key not in new_model.object_patches:
+                        new_model.add_object_patch(target_key, int8_module)
+                
                 for target_key, wrapper in wrappers_to_add:
                     new_model.add_object_patch(target_key, wrapper)
                     patched_count += 1
 
-            print(f"Applied {patched_count} LoRA patches.")
+            int8_count = len(int8_direct_patches)
+            wrapper_count = len(wrappers_to_add)
+            if int8_count > 0:
+                print(f"Applied {patched_count} LoRA patches ({int8_count} direct INT8, {wrapper_count} wrapped).")
+            else:
+                print(f"Applied {patched_count} LoRA patches.")
             return (new_model,)
             
         except Exception as e:

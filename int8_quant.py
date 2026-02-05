@@ -3,10 +3,6 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-# =============================================================================
-# Global Configuration (must be defined before use in lazy-loading functions)
-# =============================================================================
-
 _DEBUG_MODE = False
 _DEBUG_FORWARD = False
 
@@ -96,16 +92,7 @@ def _get_dequantize_jit():
 
 
 def quantize_int8(x: torch.Tensor, scale: float | torch.Tensor) -> torch.Tensor:
-    """
-    Quantize a tensor to INT8 using the provided scale.
-    
-    Args:
-        x: Input tensor (float)
-        scale: Scale factor (scalar or per-channel)
-    
-    Returns:
-        Quantized INT8 tensor
-    """
+    """Quantize a tensor to INT8 using the provided scale."""
     if isinstance(scale, (int, float)):
         jit_fn = _get_quantize_int8_jit()
         if jit_fn is not None:
@@ -122,17 +109,7 @@ def quantize_int8(x: torch.Tensor, scale: float | torch.Tensor) -> torch.Tensor:
 
 
 def quantize_int8_chunked(x: torch.Tensor, scale: torch.Tensor, chunk_size: int) -> torch.Tensor:
-    """
-    Quantize a tensor to INT8 with chunking for memory efficiency.
-    
-    Args:
-        x: Input tensor (float)
-        scale: Scale factor (scalar or per-channel)
-        chunk_size: Target number of elements per chunk
-    
-    Returns:
-        Quantized INT8 tensor
-    """
+    """Quantize a tensor to INT8 with chunking for memory efficiency."""
     total_elements = x.numel()
     
     if total_elements <= chunk_size:
@@ -182,23 +159,7 @@ def _check_nan_inf(tensor: torch.Tensor, name: str, location: str = ""):
 def dequantize(q: Tensor, scale: float | Tensor, quip_s_u: Tensor | None = None, quip_s_v: Tensor | None = None,
                hadamard_quip: bool = False, hadamard_size_in: int = 0, hadamard_size_out: int = 0,
                sign_row: Tensor | None = None, sign_col: Tensor | None = None) -> Tensor:
-    """
-    Dequantize INT8 tensor to float.
-    
-    Args:
-        q: Quantized INT8 tensor
-        scale: Scale factor (scalar or per-channel)
-        quip_s_u: QuIP dense rotation matrix U (for legacy QuIP#)
-        quip_s_v: QuIP dense rotation matrix V (for legacy QuIP#)
-        hadamard_quip: Whether to use Hadamard-QuIP dequantization
-        hadamard_size_in: Size of Hadamard transform for input dimension
-        hadamard_size_out: Size of Hadamard transform for output dimension
-        sign_row: Row signs for Hadamard-QuIP (diagonal D1)
-        sign_col: Column signs for Hadamard-QuIP (diagonal D2)
-    
-    Returns:
-        Dequantized float tensor
-    """
+    """Dequantize INT8 tensor to float."""
     total_elements = q.numel()
     
     if hadamard_quip and (hadamard_size_in > 0 or hadamard_size_out > 0):
@@ -322,11 +283,18 @@ def dequantize(q: Tensor, scale: float | Tensor, quip_s_u: Tensor | None = None,
     return q.float() * scale
 
 
+def _is_power_of_two(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
 def _pytorch_fwht_simple(x: torch.Tensor) -> torch.Tensor:
     """Simple PyTorch FWHT for fallback dequantization."""
     import math
     original_shape = x.shape
     n = original_shape[-1]
+    
+    if not _is_power_of_two(n):
+        raise ValueError(f"FWHT requires power-of-2 dimension, got {n}")
     
     x = x.reshape(-1, n)
     batch = x.shape[0]
@@ -406,6 +374,9 @@ def convert_zimage_diffusers_state_dict(sd):
         if "to_q.weight" in params and "to_k.weight" in params and "to_v.weight" in params:
             q_w, k_w, v_w = params["to_q.weight"], params["to_k.weight"], params["to_v.weight"]
             
+            for qkv_type in ["to_q", "to_k", "to_v"]:
+                params.pop(f"{qkv_type}.comfy_quant", None)
+            
             has_quip = any(f"{t}.quip_s_u" in params for t in ["to_q", "to_k", "to_v"])
             
             if has_quip:
@@ -457,6 +428,14 @@ def is_diffusers_zimage_format(sd):
     return False
 
 
+def strip_comfy_quant_keys(sd):
+    """Strip .comfy_quant metadata keys from state dict to prevent unexpected key warnings."""
+    keys_to_remove = [k for k in sd.keys() if ".comfy_quant" in k]
+    for k in keys_to_remove:
+        sd.pop(k, None)
+    return sd
+
+
 try:
     from torch.compiler import disable as compiler_disable
 except ImportError:
@@ -468,8 +447,6 @@ except ImportError:
 CHUNK_THRESHOLD_ELEMENTS = 67_108_864
 CHUNK_TARGET_ELEMENTS = 33_554_432
 
-# to ensure they're available for lazy-loading functions.
-
 _ENABLE_CUDA_SYNC = os.environ.get("INT8_ENABLE_CUDA_SYNC", "0") == "1"
 
 _CLEAR_CACHE_STRATEGY = os.environ.get("INT8_CLEAR_CACHE", "auto")
@@ -479,17 +456,7 @@ _HADAMARD_QUIP_ENABLED = os.environ.get("INT8_HADAMARD_QUIP", "0").lower() in ("
 
 
 def set_hadamard_quip_enabled(enabled: bool):
-    """
-    Enable or disable the Hadamard-QuIP kernel at runtime.
-    
-    Args:
-        enabled: True to enable Hadamard-QuIP, False to disable (use standard W8A8)
-    
-    Example:
-        from int8_quant import set_hadamard_quip_enabled
-        set_hadamard_quip_enabled(True)
-        set_hadamard_quip_enabled(False)
-    """
+    """Enable or disable the Hadamard-QuIP kernel at runtime."""
     global _HADAMARD_QUIP_ENABLED
     _HADAMARD_QUIP_ENABLED = enabled
     status = "enabled" if enabled else "disabled"
@@ -502,6 +469,33 @@ def is_hadamard_quip_enabled() -> bool:
 
 
 _DISABLE_HADAMARD_QUIP = not _HADAMARD_QUIP_ENABLED
+
+
+def warmup_int8_kernels(model, device="cuda", dtype=torch.bfloat16):
+    print("[INT8] Warming up kernels...")
+    
+    _get_quantize_int8_jit()
+    _get_dequantize_jit()
+    
+    if _TRITON_AVAILABLE:
+        _get_triton_kernels()
+        _get_hadamard_quip_kernels()
+    
+    with torch.no_grad():
+        dummy = torch.randn(1, 4096, device=device, dtype=dtype)
+        
+        for module in model.modules():
+            if hasattr(module, '_is_quantized') and module._is_quantized:
+                try:
+                    _ = module(dummy[:, :module.in_features] if dummy.shape[-1] >= module.in_features
+                              else torch.randn(1, module.in_features, device=device, dtype=dtype))
+                    break
+                except:
+                    pass
+    
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print("[INT8] Kernel warmup complete")
 
 
 def _should_clear_cache():
@@ -554,16 +548,15 @@ else:
 
 
 @torch.no_grad()
-def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype, chunk_size: int = 0, has_lora: bool = False) -> Tensor:
+def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype, chunk_size: int = 0, has_lora: bool = False, offload_to_cpu: bool = False) -> Tensor:
     """Forward with dynamic per-token activation quantization."""
-    # Use FP32 for LoRA accumulation to maintain precision
-    output_dtype = torch.float32 if has_lora else compute_dtype
+    output_dtype = compute_dtype if (has_lora and offload_to_cpu) else (torch.float32 if has_lora else compute_dtype)
     
     if chunk_size > 0 and x.shape[0] > chunk_size:
         out = torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=output_dtype)
         for i in range(0, x.shape[0], chunk_size):
             chunk = x[i:i+chunk_size]
-            out[i:i+chunk_size] = int8_forward_dynamic(chunk, weight, weight_scale, bias, compute_dtype, chunk_size=0, has_lora=has_lora)
+            out[i:i+chunk_size] = int8_forward_dynamic(chunk, weight, weight_scale, bias, compute_dtype, chunk_size=0, has_lora=has_lora, offload_to_cpu=offload_to_cpu)
             del chunk
         return out
 
@@ -576,7 +569,6 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
     if triton_kernels is not None and x.ndim >= 2:
         try:
             _log_kernel_usage("w8a8_dynamic_triton", "int8_forward_dynamic")
-            # Use FP32 output when LoRA is present for better accumulation precision
             return triton_kernels(x, weight, weight_scale, bias, compute_dtype, use_fp32_output=has_lora)
         except (RuntimeError, ValueError) as e:
             if _DEBUG_MODE:
@@ -635,16 +627,15 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
 
 
 @torch.no_grad()
-def int8_forward_static(x: Tensor, weight: Tensor, weight_scale: float | Tensor, input_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype, chunk_size: int = 0, has_lora: bool = False) -> Tensor:
+def int8_forward_static(x: Tensor, weight: Tensor, weight_scale: float | Tensor, input_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype, chunk_size: int = 0, has_lora: bool = False, offload_to_cpu: bool = False) -> Tensor:
     """Forward with static (learned) activation quantization."""
-    # Use FP32 for LoRA accumulation to maintain precision
-    output_dtype = torch.float32 if has_lora else compute_dtype
+    output_dtype = compute_dtype if (has_lora and offload_to_cpu) else (torch.float32 if has_lora else compute_dtype)
     
     if chunk_size > 0 and x.shape[0] > chunk_size:
         out = torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=output_dtype)
         for i in range(0, x.shape[0], chunk_size):
             chunk = x[i:i+chunk_size]
-            out[i:i+chunk_size] = int8_forward_static(chunk, weight, weight_scale, input_scale, bias, compute_dtype, chunk_size=0, has_lora=has_lora)
+            out[i:i+chunk_size] = int8_forward_static(chunk, weight, weight_scale, input_scale, bias, compute_dtype, chunk_size=0, has_lora=has_lora, offload_to_cpu=offload_to_cpu)
             del chunk
         return out
     
@@ -655,9 +646,6 @@ def int8_forward_static(x: Tensor, weight: Tensor, weight_scale: float | Tensor,
     del x_8, x_8_contig, weight_T
     
     scale = weight_scale * input_scale
-    
-    # Use FP32 for LoRA accumulation to maintain precision
-    output_dtype = torch.float32 if has_lora else compute_dtype
     
     total_elements = res.numel()
     
@@ -686,12 +674,7 @@ def int8_forward_static(x: Tensor, weight: Tensor, weight_scale: float | Tensor,
 
 @torch.no_grad()
 def chunked_lora_forward(x: Tensor, down: Tensor, up: Tensor, alpha: float, output: Tensor, offset: int = 0, size: int = 0):
-    """Memory-efficient float LoRA forward pass using chunking.
-    
-    When computing in FP32 on Ampere+ GPUs, TF32 is disabled to ensure
-    "true FP32" matmul precision for consistent numerics with BF16/FP16 baselines.
-    """
-    # Normalize dtype/device to match output (robust approach)
+    """Memory-efficient float LoRA forward pass using chunking."""
     ref = output
     if x.device != ref.device:
         x = x.to(device=ref.device)
@@ -708,8 +691,6 @@ def chunked_lora_forward(x: Tensor, down: Tensor, up: Tensor, alpha: float, outp
     
     chunk_rows = max(1, CHUNK_TARGET_ELEMENTS // max(down.shape[0], up.shape[0]))
     
-    # When computing LoRA in FP32 on Ampere+ GPUs, disable TF32 to ensure
-    # "true FP32" matmul precision for consistent numerics vs BF16/FP16 baselines
     is_fp32 = (x.dtype == torch.float32)
     old_allow_tf32 = None
     if is_fp32 and torch.cuda.is_available():
@@ -753,7 +734,6 @@ def chunked_lora_forward(x: Tensor, down: Tensor, up: Tensor, alpha: float, outp
                 if _ENABLE_CUDA_SYNC and i % (chunk_rows * 4) == 0:
                     torch.cuda.synchronize()
     finally:
-        # Restore TF32 setting if we changed it
         if old_allow_tf32 is not None:
             torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
 
@@ -764,9 +744,12 @@ def chunked_int8_lora_forward(x: Tensor, down: Tensor, up: Tensor, down_scale: f
     x_shape = x.shape
     x_2d = x.reshape(-1, x_shape[-1])
     
+    inter_dtype = output.dtype if output.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
+    
     chunk_rows = max(1, CHUNK_TARGET_ELEMENTS // max(down.shape[0], up.shape[0]))
     
     if x_2d.shape[0] <= chunk_rows:
+        # First stage: INT8 matmul x @ down^T
         x_int8, x_scale = quantize_int8_axiswise(x_2d, dim=-1)
         x_int8_contig = x_int8.contiguous() if not x_int8.is_contiguous() else x_int8
         down_T = down.T.contiguous() if not down.T.is_contiguous() else down.T
@@ -775,31 +758,32 @@ def chunked_int8_lora_forward(x: Tensor, down: Tensor, up: Tensor, down_scale: f
         
         lora_inter = lora_inter.to(dtype=torch.float32)
         lora_inter.mul_(x_scale * down_scale)
+        lora_inter = lora_inter.to(inter_dtype)
+        del x_scale
         
-        inter_int8, inter_scale = quantize_int8_axiswise(lora_inter, dim=-1)
-        del lora_inter, x_scale
-        
-        inter_int8_contig = inter_int8.contiguous() if not inter_int8.is_contiguous() else inter_int8
-        up_T = up.T.contiguous() if not up.T.is_contiguous() else up.T
-        lora_out = torch._int_mm(inter_int8_contig, up_T)
-        del inter_int8, inter_int8_contig, up_T
-        
-        lora_out = lora_out.to(dtype=torch.float32)
-        lora_out.mul_(inter_scale * up_scale)
+        up_float = (up.float() * up_scale).to(inter_dtype)
+        lora_out = F.linear(lora_inter, up_float)
+        del lora_inter, up_float
         
         if size > 0:
             output_view = output.reshape(-1, output.shape[-1])
-            output_view[:, offset:offset+size].add_(lora_out, alpha=alpha)
+            if lora_out.shape[1] != size:
+                if lora_out.shape[1] > size:
+                    lora_out = lora_out[:, :size]
+                else:
+                    lora_out = torch.nn.functional.pad(lora_out, (0, size - lora_out.shape[1]))
+            output_view[:, offset:offset+size].add_(lora_out.to(output.dtype), alpha=alpha)
         else:
             lora_out = lora_out.reshape(*x_shape[:-1], lora_out.shape[-1])
-            output.add_(lora_out, alpha=alpha)
-        del lora_out, inter_scale
+            output.add_(lora_out.to(output.dtype), alpha=alpha)
+        del lora_out
     else:
         output_view = output.reshape(-1, output.shape[-1])
         for i in range(0, x_2d.shape[0], chunk_rows):
             end = min(i + chunk_rows, x_2d.shape[0])
             x_chunk = x_2d[i:end]
             
+            # First stage: INT8 matmul x @ down^T
             x_int8, x_scale = quantize_int8_axiswise(x_chunk, dim=-1)
             x_int8_contig = x_int8.contiguous() if not x_int8.is_contiguous() else x_int8
             down_T = down.T.contiguous() if not down.T.is_contiguous() else down.T
@@ -808,24 +792,24 @@ def chunked_int8_lora_forward(x: Tensor, down: Tensor, up: Tensor, down_scale: f
             
             lora_inter = lora_inter.to(dtype=torch.float32)
             lora_inter.mul_(x_scale * down_scale)
+            lora_inter = lora_inter.to(inter_dtype)
+            del x_scale
             
-            inter_int8, inter_scale = quantize_int8_axiswise(lora_inter, dim=-1)
-            del lora_inter, x_scale
-            
-            inter_int8_contig = inter_int8.contiguous() if not inter_int8.is_contiguous() else inter_int8
-            up_T = up.T.contiguous() if not up.T.is_contiguous() else up.T
-            lora_out = torch._int_mm(inter_int8_contig, up_T)
-            del inter_int8, inter_int8_contig, up_T
-            
-            lora_out = lora_out.to(dtype=torch.float32)
-            lora_out.mul_(inter_scale * up_scale)
+            up_float = (up.float() * up_scale).to(inter_dtype)
+            lora_out = F.linear(lora_inter, up_float)
+            del lora_inter, up_float
             
             if size > 0:
-                output_view[i:end, offset:offset+size].add_(lora_out, alpha=alpha)
+                if lora_out.shape[1] != size:
+                    if lora_out.shape[1] > size:
+                        lora_out = lora_out[:, :size]
+                    else:
+                        lora_out = torch.nn.functional.pad(lora_out, (0, size - lora_out.shape[1]))
+                output_view[i:end, offset:offset+size].add_(lora_out.to(output.dtype), alpha=alpha)
             else:
-                output_view[i:end].add_(lora_out, alpha=alpha)
+                output_view[i:end].add_(lora_out.to(output.dtype), alpha=alpha)
                 
-            del lora_out, inter_scale
+            del lora_out
             
             if _ENABLE_CUDA_SYNC and i % (chunk_rows * 4) == 0:
                 torch.cuda.synchronize()
@@ -892,34 +876,25 @@ def reset_kernel_stats():
 def cast_int8_weights(layer, device):
     """Cast INT8 weights to target device, supporting offloading."""
     weight = layer.weight.to(device)
-    
+
     weight_scale = getattr(layer, "weight_scale", None)
     if isinstance(weight_scale, torch.Tensor):
-                weight_scale = weight_scale.to(weight.device)
-    
+        weight_scale = weight_scale.to(weight.device)
+
     input_scale = getattr(layer, "input_scale", None)
     if isinstance(input_scale, torch.Tensor):
-                input_scale = input_scale.to(weight.device)
-        
-    bias = None
-    if getattr(layer, "bias", None) is not None:
-                bias = layer.bias.to(weight.device)
-        
+        input_scale = input_scale.to(weight.device)
+
+    bias = getattr(layer, "bias", None)
+    if bias is not None:
+        bias = bias.to(weight.device)
+
     return weight, weight_scale, input_scale, bias
 
 
 if _COMFY_OPS_AVAILABLE:
     class Int8TensorwiseOps(manual_cast):
-        """
-        Custom ComfyUI operations for INT8 tensorwise quantization.
-        
-        This properly integrates with ComfyUI's model loading while keeping
-        the fast torch._int_mm forward path.
-        
-        Usage:
-            model_options = {"custom_operations": Int8TensorwiseOps}
-            model = comfy.sd.load_diffusion_model(path, model_options=model_options)
-        """
+        """Custom ComfyUI operations for INT8 tensorwise quantization."""
         excluded_names = []
         offload_to_cpu = False
         chunk_size = 0
@@ -927,7 +902,6 @@ if _COMFY_OPS_AVAILABLE:
         debug_mode = False
         
         class Linear(manual_cast.Linear):
-            """Linear layer that directly loads int8 weights and uses fast _int_mm."""
             
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
@@ -972,7 +946,6 @@ if _COMFY_OPS_AVAILABLE:
                 for key in weight_scale_keys:
                     if key in state_dict:
                         if weight_scale is not None:
-                            # Conflict: multiple scale keys found
                             print(f"[INT8 WARNING] Multiple weight_scale keys found for {prefix}: "
                                   f"'{found_weight_scale_key}' and '{key}'. Using '{key}'.")
                         weight_scale = state_dict.pop(key)
@@ -989,7 +962,6 @@ if _COMFY_OPS_AVAILABLE:
                 for key in input_scale_keys:
                     if key in state_dict:
                         if input_scale is not None:
-                            # Conflict: multiple scale keys found
                             print(f"[INT8 WARNING] Multiple input_scale keys found for {prefix}: "
                                   f"'{found_input_scale_key}' and '{key}'. Using '{key}'.")
                         input_scale = state_dict.pop(key)
@@ -1105,9 +1077,19 @@ if _COMFY_OPS_AVAILABLE:
                             
                             if isinstance(weight_scale, torch.Tensor):
                                 if weight_scale.numel() == self.out_features:
-                                    weight_scale = weight_scale.float().reshape(1, -1)
+                                    weight_scale = weight_scale.float().reshape(-1)
+                                elif weight_scale.numel() == 1:
+                                    weight_scale = weight_scale.float().view(())
                                 else:
-                                    weight_scale = weight_scale.float().mean().view(())
+                                    if weight_scale.numel() < self.out_features:
+                                        pad_size = self.out_features - weight_scale.numel()
+                                        last_val = weight_scale[-1].item()
+                                        weight_scale = torch.cat([
+                                            weight_scale.float(),
+                                            torch.full((pad_size,), last_val, dtype=torch.float32, device=weight_scale.device)
+                                        ])
+                                    else:
+                                        weight_scale = weight_scale[:self.out_features].float()
                             else:
                                 weight_scale = torch.tensor(weight_scale, dtype=torch.float32)
                             
@@ -1171,7 +1153,7 @@ if _COMFY_OPS_AVAILABLE:
                         missing_keys.remove(k)
                 
                 for k in list(unexpected_keys):
-                    if k.startswith(prefix) and (".quip_s_u" in k or ".quip_s_v" in k):
+                    if k.startswith(prefix) and (".quip_s_u" in k or ".quip_s_v" in k or ".comfy_quant" in k):
                         unexpected_keys.remove(k)
             
             def forward(self, x: Tensor) -> Tensor:
@@ -1192,9 +1174,8 @@ if _COMFY_OPS_AVAILABLE:
                     lora_patches = getattr(self, "lora_patches", [])
                     has_lora = len(lora_patches) > 0
                     
-                    # Use FP32 for LoRA accumulation to maintain precision
                     compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
-                    acc_dtype = torch.float32 if has_lora else compute_dtype
+                    acc_dtype = compute_dtype if (has_lora and Int8TensorwiseOps.offload_to_cpu) else (torch.float32 if has_lora else compute_dtype)
                     
                     if _DEBUG_MODE and has_lora:
                         print(f"[DEBUG LoRA NON-QUANTIZED] Layer: {self}")
@@ -1206,7 +1187,6 @@ if _COMFY_OPS_AVAILABLE:
                         weight, bias, offload_stream = cast_bias_weight(
                             self, x, offloadable=True
                         )
-                        # Cast weight to accumulation dtype if LoRA is present
                         if has_lora:
                             weight = weight.to(acc_dtype)
                             if bias is not None:
@@ -1232,7 +1212,6 @@ if _COMFY_OPS_AVAILABLE:
                             print(f"[DEBUG LoRA APPLY NON-QUANTIZED]   x_2d dtype: {x_2d.dtype}")
                             print(f"[DEBUG LoRA APPLY NON-QUANTIZED]   out/base dtype: {out.dtype}")
                         
-                        # Ensure x_2d matches out dtype for LoRA application (FP32 accumulation case)
                         if x_2d.dtype != out.dtype:
                             if _DEBUG_MODE:
                                 print(f"[DEBUG LoRA APPLY NON-QUANTIZED]   Casting x_2d from {x_2d.dtype} to {out.dtype}")
@@ -1281,7 +1260,6 @@ if _COMFY_OPS_AVAILABLE:
                                     d = dequantize(down, down_scale).to(device=out.device, dtype=out.dtype)
                                     u = dequantize(up, up_scale).to(device=out.device, dtype=out.dtype)
                                     
-                                    # Disable TF32 for true FP32 matmul precision on Ampere+ GPUs
                                     is_fp32 = (out.dtype == torch.float32)
                                     if is_fp32 and torch.cuda.is_available():
                                         old_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -1315,9 +1293,6 @@ if _COMFY_OPS_AVAILABLE:
                                 
                                 del d, u
                     
-                    # Cast back to compute_dtype if we used FP32 for LoRA accumulation
-                    # This ensures consistency between quantized/non-quantized and LoRA/non-LoRA layers
-                    # Policy B: Use FP32 as temporary accumulator, then cast back to compute_dtype
                     if has_lora and out.dtype != compute_dtype:
                         if _DEBUG_MODE:
                             print(f"[DEBUG LoRA CAST NON-QUANTIZED] Casting output from {out.dtype} back to {compute_dtype}")
@@ -1334,10 +1309,9 @@ if _COMFY_OPS_AVAILABLE:
                 
                 weight, weight_scale, input_scale, bias = cast_int8_weights(self, x_2d.device)
                 
-                # Check for LoRA patches and use FP32 accumulation if present
                 lora_patches = getattr(self, "lora_patches", [])
                 has_lora = len(lora_patches) > 0
-                acc_dtype = torch.float32 if has_lora else compute_dtype
+                acc_dtype = compute_dtype if (has_lora and Int8TensorwiseOps.offload_to_cpu) else (torch.float32 if has_lora else compute_dtype)
                 
                 if bias is not None and has_lora and bias.dtype != acc_dtype:
                     bias = bias.to(acc_dtype)
@@ -1470,7 +1444,8 @@ if _COMFY_OPS_AVAILABLE:
                             x_2d, weight, weight_scale,
                             input_scale, bias, acc_dtype,
                             chunk_size=Int8TensorwiseOps.chunk_size,
-                            has_lora=bool(lora_patches)
+                            has_lora=bool(lora_patches),
+                            offload_to_cpu=Int8TensorwiseOps.offload_to_cpu
                         )
                     else:
                         _log_kernel_usage("w8a8_dynamic", self.__class__.__name__)
@@ -1478,7 +1453,8 @@ if _COMFY_OPS_AVAILABLE:
                             x_2d, weight, weight_scale,
                             bias, acc_dtype,
                             chunk_size=Int8TensorwiseOps.chunk_size,
-                            has_lora=bool(lora_patches)
+                            has_lora=bool(lora_patches),
+                            offload_to_cpu=Int8TensorwiseOps.offload_to_cpu
                         )
                 else:
                     _log_kernel_usage("dequant_fallback", self.__class__.__name__)
@@ -1515,7 +1491,6 @@ if _COMFY_OPS_AVAILABLE:
                         print(f"[DEBUG LoRA APPLY]   compute_dtype: {compute_dtype}")
                         print(f"[DEBUG LoRA APPLY]   acc_dtype used: {acc_dtype}")
                     
-                    # Ensure x_2d matches y dtype for LoRA application (FP32 accumulation case)
                     if x_2d.dtype != y.dtype:
                         if _DEBUG_MODE:
                             print(f"[DEBUG LoRA APPLY]   Casting x_2d from {x_2d.dtype} to {y.dtype}")
@@ -1570,7 +1545,6 @@ if _COMFY_OPS_AVAILABLE:
                                 d = dequantize(down, down_scale).to(device=y.device, dtype=y.dtype)
                                 u = dequantize(up, up_scale).to(device=y.device, dtype=y.dtype)
                                 
-                                # Disable TF32 for true FP32 matmul precision on Ampere+ GPUs
                                 is_fp32 = (y.dtype == torch.float32)
                                 if is_fp32 and torch.cuda.is_available():
                                     old_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -1602,9 +1576,6 @@ if _COMFY_OPS_AVAILABLE:
                             del d, u
                     _log_memory("after LoRA application", is_forward=True)
 
-                # Cast back to compute_dtype if we used FP32 for LoRA accumulation
-                # This ensures consistency between quantized/non-quantized and LoRA/non-LoRA layers
-                # Policy B: Use FP32 as temporary accumulator, then cast back to compute_dtype
                 if has_lora and y.dtype != compute_dtype:
                     if _DEBUG_MODE:
                         print(f"[DEBUG LoRA CAST] Casting output from {y.dtype} back to {compute_dtype}")
